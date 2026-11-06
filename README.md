@@ -1,3 +1,5 @@
+<p><img src="docs/brand/MeguvizCompute.svg" width="96" alt="MeguvizCompute 图标"></p>
+
 # MeguvizCompute
 
 当前是可运行的 **0.1.0 开发 SDK**。Windows 与 Android 模拟器上的 CPU 公共契约、真实 ncnn CPU 小图已验证；ARM64/ARMv7 的 ncnn Vulkan 静态依赖闭包已交叉构建并从安装目录独立链接。`bil-rife-ncnn-android` 的完整 C1–C6 资格尚未完成，不能称为 GPU/AHB 插帧引擎发布候选。逐 gate 状态与实际证据见 [STATUS.json](STATUS.json)。
