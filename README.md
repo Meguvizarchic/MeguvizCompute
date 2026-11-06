@@ -1,4 +1,36 @@
+<div align="center">
+
+<img src="docs/brand/MeguvizCompute.svg" width="96" height="96" alt="MeguvizCompute">
+
 # MeguvizCompute
+
+**Vulkan / ncnn 通用 GPU 计算 SDK**
+
+C ABI · 资源租约 · AHB 互操作 · shaderpack
+
+<br>
+
+[![License](https://img.shields.io/badge/license-MIT-00AEEC?style=flat-square&labelColor=2d3a55)](LICENSE)
+[![Language](https://img.shields.io/badge/lang-C%2B%2B-DEA584?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizCompute)
+[![Issues](https://img.shields.io/github/issues/Meguvizarchic/MeguvizCompute?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizCompute/issues)
+
+[已实现](#已实现) · [未实现与未取得的证据](#未实现与未取得的证据) · [构建与验证](#构建与验证) · [证据与回退](#证据与回退)
+
+</div>
+
+---
+
+<details>
+<summary><b>目录</b></summary>
+
+- [已实现](#已实现)
+- [未实现与未取得的证据](#未实现与未取得的证据)
+- [构建与验证](#构建与验证)
+- [证据与回退](#证据与回退)
+
+</details>
+
+---
 
 当前是可运行的 **0.1.0 开发 SDK**。Windows 与 Android 模拟器上的 CPU 公共契约、真实 ncnn CPU 小图已验证；ARM64/ARMv7 的 ncnn Vulkan 静态依赖闭包已交叉构建并从安装目录独立链接。`bil-rife-ncnn-android` 的完整 C1–C6 资格尚未完成，不能称为 GPU/AHB 插帧引擎发布候选。逐 gate 状态与实际证据见 [STATUS.json](STATUS.json)。
 
