@@ -149,12 +149,36 @@ struct MgcSession
     std::mutex mutex;
     std::condition_variable work, retired;
     std::deque<MgcTicket *> queue;
-    uint32_t max_in_flight = 1, in_flight = 0;
+    uint32_t max_in_flight = 1, in_flight = 0, preparing = 0;
     bool closing = false;
     std::thread worker;
 };
 namespace
 {
+// A caller's context callbacks run outside the session lock. Pin the session
+// until submit finishes, so a reentrant/concurrent close cannot free it.
+struct SubmissionPreparation
+{
+    MgcSession *session = nullptr;
+    MgcStatus acquire(MgcSession *s)
+    {
+        std::lock_guard<std::mutex> lock(s->mutex);
+        if (s->closing)
+            return MGC_BUSY;
+        if (s->preparing == UINT32_MAX)
+            return MGC_BACKPRESSURE;
+        ++s->preparing;
+        session = s;
+        return MGC_SUCCESS;
+    }
+    ~SubmissionPreparation()
+    {
+        if (!session)
+            return;
+        std::lock_guard<std::mutex> lock(session->mutex);
+        --session->preparing;
+    }
+};
 thread_local MgcSession *worker_session = nullptr;
 thread_local MgcDomain *active_domain = nullptr;
 thread_local MgcTicket *active_ticket = nullptr;
@@ -939,7 +963,7 @@ extern "C"
             std::lock_guard<std::mutex> lock(s->mutex);
             s->closing = true;
             s->work.notify_all();
-            if (s->in_flight)
+            if (s->in_flight || s->preparing)
                 return MGC_BUSY;
         }
         if (s->worker.joinable())
@@ -966,9 +990,12 @@ extern "C"
         rc = operation_valid(d);
         if (rc)
             return rc;
+        SubmissionPreparation preparation;
         bool retained = false;
         try
         {
+            rc = preparation.acquire(s);
+            if (rc != MGC_SUCCESS) return rc;
             auto t = std::make_unique<MgcTicket>();
             t->desc = d;
             t->result.header = MGC_HEADER_INIT(MgcCompletion);
@@ -1061,9 +1088,12 @@ extern "C"
         if (!d.execute || d.lease_count > 64 || (d.lease_count && !d.leases) ||
             bool(d.retain_context) != bool(d.release_context))
             return MGC_INVALID_ARGUMENT;
+        SubmissionPreparation preparation;
         bool retained = false;
         try
         {
+            rc = preparation.acquire(s);
+            if (rc != MGC_SUCCESS) return rc;
             auto t = std::make_unique<MgcTicket>();
             t->desc.header = MGC_HEADER_INIT(MgcSubmitDesc);
             t->desc.request_id = d.request_id;
