@@ -1,8 +1,14 @@
 #include "consumer_common.h"
 #include <math.h>
 #include <meguviz/kernels.h>
+#ifdef MGC_STATISTICS_CLI_ENABLED
+int mgc_statistics_cli(int argc, char **argv);
+#endif
 int main(int argc, char **argv)
 {
+#ifdef MGC_STATISTICS_CLI_ENABLED
+    if (argc > 1) return mgc_statistics_cli(argc, argv);
+#endif
     MgcRuntime *r;
     MgcDomain *d;
     MgcSession *s;
