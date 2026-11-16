@@ -96,9 +96,13 @@ int main()
     REQUIRE(mgc_private_submit_host_job(s, &job, &no) == MGC_BACKPRESSURE && no == nullptr);
     REQUIRE(gate.refs == 1);
     REQUIRE(mgc_session_drain(s, 1000) == MGC_TIMEOUT);
-    REQUIRE(mgc_ticket_cancel(t) == 0);
     MgcCompletion current{};
     current.header = MGC_HEADER_INIT(MgcCompletion);
+    REQUIRE(mgc_private_session_cancel(nullptr, t) == MGC_INVALID_ARGUMENT);
+    REQUIRE(mgc_private_session_cancel(s, nullptr) == MGC_INVALID_ARGUMENT);
+    REQUIRE(mgc_private_session_cancel(second, t) == MGC_INVALID_ARGUMENT);
+    REQUIRE(mgc_ticket_query(t, &current) == MGC_BUSY && !current.result_discarded);
+    REQUIRE(mgc_private_session_cancel(s, t) == MGC_SUCCESS);
     REQUIRE(mgc_ticket_query(t, &current) == MGC_BUSY && current.result_discarded);
     REQUIRE(gate.callbacks == 0 && gate.refs == 1);
     REQUIRE(mgc_session_close(s) == MGC_BUSY);
@@ -111,8 +115,15 @@ int main()
     REQUIRE(gate.callbacks == 1 && gate.refs == 0 && gate.completion.execution_retired &&
             gate.completion.host_finalized && gate.completion.terminal == MGC_TERMINAL_CANCELLED);
     REQUIRE(mgc_ticket_query(t, &current) == 0);
-    mgc_ticket_release(t);
     REQUIRE(mgc_session_close(s) == 0);
+    // A retained terminal ticket keeps only its identity, not a dangling
+    // session pointer. A replacement session cannot inherit its rights.
+    MgcSession *replacement = nullptr;
+    REQUIRE(mgc_session_create(d, &sd, &replacement) == MGC_SUCCESS);
+    REQUIRE(mgc_private_session_cancel(replacement, t) == MGC_INVALID_ARGUMENT);
+    REQUIRE(mgc_ticket_query(t, &current) == MGC_SUCCESS && current.status == MGC_CANCELLED);
+    REQUIRE(mgc_session_close(replacement) == MGC_SUCCESS);
+    mgc_ticket_release(t);
     MgcResourceDesc res{};
     res.header = MGC_HEADER_INIT(MgcResourceDesc);
     res.capacity_bytes = 257;

@@ -127,8 +127,12 @@ struct MgcLease
     MgcLeaseDesc desc{};
     uint32_t maps = 0;
 };
+// Tickets can outlive their session. Keep a separate identity alive so a new
+// session at the same address cannot acquire an old ticket's cancellation right.
+struct SessionIdentity {};
 struct MgcTicket
 {
+    std::shared_ptr<const SessionIdentity> session_identity;
     std::atomic<uint32_t> refs{1};
     std::atomic<bool> cancelled{false};
     std::mutex mutex;
@@ -140,6 +144,7 @@ struct MgcTicket
 };
 struct MgcSession
 {
+    std::shared_ptr<const SessionIdentity> identity = std::make_shared<SessionIdentity>();
     MgcDomain *domain = nullptr;
     std::mutex mutex;
     std::condition_variable work, retired;
@@ -467,6 +472,7 @@ MgcStatus accept(MgcSession *s, std::unique_ptr<MgcTicket> &t, MgcTicket **out)
         return MGC_BUSY;
     if (s->in_flight >= s->max_in_flight)
         return MGC_BACKPRESSURE;
+    t->session_identity = s->identity;
     s->queue.push_back(t.get());
     ++s->in_flight;
     for (auto *l : t->leases)
@@ -1006,6 +1012,12 @@ extern "C"
             t->result.result_discarded = 1;
         }
         return MGC_SUCCESS;
+    }
+    MgcStatus mgc_private_session_cancel(MgcSession *s, MgcTicket *t)
+    {
+        if (!s || !t || s->identity != t->session_identity)
+            return MGC_INVALID_ARGUMENT;
+        return mgc_ticket_cancel(t);
     }
     MgcStatus mgc_ticket_query(MgcTicket *t, MgcCompletion *out)
     {

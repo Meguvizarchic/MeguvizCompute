@@ -22,6 +22,11 @@ typedef struct MgcHostJobDesc {
     MgcContextFn release_context;
 } MgcHostJobDesc;
 MgcStatus mgc_private_submit_host_job(MgcSession *session, const MgcHostJobDesc *desc, MgcTicket **ticket);
+/* Only the accepting session may cancel through this entry. A foreign ticket
+ * returns INVALID_ARGUMENT without changing it, including after its original
+ * session was closed. Both handles must be valid; session close is externally
+ * synchronized as with the other session operations. */
+MgcStatus mgc_private_session_cancel(MgcSession *session, MgcTicket *ticket);
 uint32_t mgc_private_ticket_cancelled(MgcTicket *ticket);
 /* Returned domain is retained by the caller, allowing immutable plans to pin
  * it. It is not a borrowed raw VkDevice. */
