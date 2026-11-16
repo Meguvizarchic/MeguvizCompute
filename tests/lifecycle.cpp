@@ -1,6 +1,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 #include <meguviz/compute.h>
 #include <meguviz/compute_job.h>
@@ -19,7 +20,7 @@ struct Gate
 {
     std::mutex mutex;
     std::condition_variable cv;
-    bool started = false, finish = false;
+    bool started = false, finish = false, device_lost = false;
     std::atomic<int> refs{0}, callbacks{0};
     MgcCompletion completion{};
     MgcSession *session = nullptr;
@@ -31,7 +32,7 @@ static MgcStatus block(void *p, MgcTicket *t)
     g.started = true;
     g.cv.notify_all();
     g.cv.wait(lock, [&] { return g.finish; });
-    return mgc_private_ticket_cancelled(t) ? MGC_CANCELLED : MGC_SUCCESS;
+    return g.device_lost ? MGC_DEVICE_LOST : mgc_private_ticket_cancelled(t) ? MGC_CANCELLED : MGC_SUCCESS;
 }
 static void retain(void *p)
 {
@@ -56,6 +57,30 @@ int main()
     rd.header = MGC_HEADER_INIT(MgcRuntimeDesc);
     rd.provider = MGC_PROVIDER_CPU_REFERENCE;
     rd.memory_budget_bytes = 256;
+    // Old complete prefixes remain valid; incomplete optional scalars must
+    // never be interpreted as a complete measurement configuration.
+    for (auto offset : {offsetof(MgcRuntimeDesc, measurement_flags),
+                        offsetof(MgcRuntimeDesc, measurement_reserved)})
+    {
+        for (uint32_t bytes = 1; bytes < sizeof(uint32_t); ++bytes)
+        {
+            MgcRuntimeDesc partial = rd;
+            partial.header.struct_size = static_cast<uint32_t>(offset + bytes);
+            partial.measurement_flags = MGC_MEASURE_GPU_TIMESTAMPS;
+            MgcRuntime *invalid = reinterpret_cast<MgcRuntime *>(1);
+            REQUIRE(mgc_runtime_create(&partial, &invalid) == MGC_UNSUPPORTED_ABI && invalid == nullptr);
+        }
+    }
+    for (auto size : {offsetof(MgcRuntimeDesc, measurement_flags),
+                      offsetof(MgcRuntimeDesc, measurement_reserved), sizeof(MgcRuntimeDesc)})
+    {
+        MgcRuntimeDesc complete = rd;
+        complete.header.struct_size = static_cast<uint32_t>(size);
+        MgcRuntime *valid = nullptr;
+        REQUIRE(mgc_runtime_create(&complete, &valid) == MGC_SUCCESS && valid);
+        REQUIRE(mgc_runtime_close(valid) == MGC_SUCCESS);
+        mgc_runtime_release(valid);
+    }
     MgcRuntime *r = nullptr;
     REQUIRE(mgc_runtime_create(&rd, &r) == 0);
     MgcDomainDesc dd{};
@@ -115,15 +140,40 @@ int main()
     REQUIRE(gate.callbacks == 1 && gate.refs == 0 && gate.completion.execution_retired &&
             gate.completion.host_finalized && gate.completion.terminal == MGC_TERMINAL_CANCELLED);
     REQUIRE(mgc_ticket_query(t, &current) == 0);
+    MgcTicket *retired_from_first = t;
+    // A cancellation racing a device failure still discards any output, but
+    // must not report the job as merely cancelled and hide the failure.
+    Gate lost;
+    lost.session = second;
+    lost.device_lost = true;
+    job.context = &lost;
+    REQUIRE(mgc_private_submit_host_job(second, &job, &t) == MGC_ACCEPTED);
+    {
+        std::unique_lock<std::mutex> lock(lost.mutex);
+        REQUIRE(lost.cv.wait_for(lock, std::chrono::seconds(2), [&] { return lost.started; }));
+    }
+    REQUIRE(mgc_ticket_cancel(t) == MGC_SUCCESS);
+    {
+        std::lock_guard<std::mutex> lock(lost.mutex);
+        lost.finish = true;
+    }
+    lost.cv.notify_all();
+    REQUIRE(mgc_session_drain(second, 2000000000) == MGC_SUCCESS);
+    REQUIRE(lost.callbacks == 1 && lost.refs == 0);
+    REQUIRE(lost.completion.terminal == MGC_TERMINAL_DEVICE_LOST &&
+            lost.completion.status == MGC_DEVICE_LOST && lost.completion.result_discarded);
+    REQUIRE(mgc_ticket_query(t, &current) == MGC_SUCCESS &&
+            current.status == MGC_DEVICE_LOST && current.result_discarded);
+    mgc_ticket_release(t);
     REQUIRE(mgc_session_close(s) == 0);
     // A retained terminal ticket keeps only its identity, not a dangling
     // session pointer. A replacement session cannot inherit its rights.
     MgcSession *replacement = nullptr;
     REQUIRE(mgc_session_create(d, &sd, &replacement) == MGC_SUCCESS);
-    REQUIRE(mgc_private_session_cancel(replacement, t) == MGC_INVALID_ARGUMENT);
-    REQUIRE(mgc_ticket_query(t, &current) == MGC_SUCCESS && current.status == MGC_CANCELLED);
+    REQUIRE(mgc_private_session_cancel(replacement, retired_from_first) == MGC_INVALID_ARGUMENT);
+    REQUIRE(mgc_ticket_query(retired_from_first, &current) == MGC_SUCCESS && current.status == MGC_CANCELLED);
     REQUIRE(mgc_session_close(replacement) == MGC_SUCCESS);
-    mgc_ticket_release(t);
+    mgc_ticket_release(retired_from_first);
     MgcResourceDesc res{};
     res.header = MGC_HEADER_INIT(MgcResourceDesc);
     res.capacity_bytes = 257;

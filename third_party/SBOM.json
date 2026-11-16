@@ -20,6 +20,13 @@
       "license": "See bundled upstream LICENSE.txt",
       "scope": "Vulkan static runtime closure",
       "source": "https://github.com/nihui/glslang"
+    },
+    {
+      "name": "LLVM OpenMP runtime",
+      "version": "Android NDK 30.0.16248370 / LLVM 21.0.0",
+      "license": "Apache-2.0 WITH LLVM-exception; see LLVM NOTICE for legacy terms",
+      "scope": "Optional Android ARM static OpenMP profile only",
+      "source": "https://github.com/llvm/llvm-project/tree/2d287f51eff2a5fbf84458a33f7fb2493cf67965/openmp"
     }
   ],
   "research_weights_included": false,

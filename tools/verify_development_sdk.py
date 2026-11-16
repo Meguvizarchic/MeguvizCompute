@@ -28,7 +28,10 @@ def environment():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preset', default='windows-cpu', choices=['windows-cpu', 'windows-reference'])
+    parser.add_argument('--build-dir', type=pathlib.Path)
+    parser.add_argument('--prefix', type=pathlib.Path)
     args = parser.parse_args()
+    build = args.build_dir.resolve() if args.build_dir else ROOT/'build'/args.preset
     out = ROOT/'build/reports'/('sdk-' + args.preset + '-' + str(time.time_ns()))
     out.mkdir(parents=True)
     records = []
@@ -44,11 +47,11 @@ def main():
         if not ok:
             raise RuntimeError(str(log) + '\n' + log.read_text(errors='replace')[-10000:])
 
-    run('configure', [CMAKE, '--preset', args.preset])
-    run('build', [CMAKE, '--build', '--preset', args.preset])
-    run('test', [CMAKE.parent/'ctest.exe', '--preset', args.preset, '--output-junit', out/'ctest.xml'])
-    prefix = ROOT/'build/install'/args.preset
-    run('install', [CMAKE, '--install', ROOT/'build'/args.preset, '--prefix', prefix])
+    run('configure', [CMAKE, '--preset', args.preset, '-B', build])
+    run('build', [CMAKE, '--build', build, '--parallel', '4'])
+    run('test', [CMAKE.parent/'ctest.exe', '--test-dir', build, '--output-on-failure', '--output-junit', out/'ctest.xml'])
+    prefix = args.prefix.resolve() if args.prefix else ROOT/'build/install'/args.preset
+    run('install', [CMAKE, '--install', build, '--prefix', prefix])
     src = out/'external-source'
     src.mkdir()
     examples = ['c_consumer.c', 'consumer_common.h', 'tensor_statistics.c']

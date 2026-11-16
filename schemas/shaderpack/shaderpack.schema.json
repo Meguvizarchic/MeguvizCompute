@@ -167,7 +167,30 @@
         },
         "reflection_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "effective_options": {
+          "type": "object"
+        },
+        "target_facts": {
+          "$ref": "target-facts.schema.json"
+        },
+        "target_facts_hash": {
+          "$ref": "#/$defs/sha256"
         }
+      },
+      "dependentRequired": {
+        "effective_options": [
+          "target_facts",
+          "target_facts_hash"
+        ],
+        "target_facts": [
+          "effective_options",
+          "target_facts_hash"
+        ],
+        "target_facts_hash": [
+          "effective_options",
+          "target_facts"
+        ]
       }
     }
   }

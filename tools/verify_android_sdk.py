@@ -51,8 +51,17 @@ extern "C" __attribute__((visibility("default"))) int mgc_test_entry() {
   ncnn::Net net;net.opt.use_vulkan_compute=false;
   return mgc_query_build_info(&info);
 }
+extern "C" __attribute__((visibility("default"))) int mgc_test_owner_entry(MgcDomain* domain) {
+#if NCNN_VULKAN
+  meguviz::NcnnDomainOwner* owner=nullptr;
+  const auto status=meguviz::ncnn_domain_owner_create(domain,&owner);
+  return status ? status : meguviz::ncnn_domain_owner_release(owner);
+#else
+  (void)domain;return MGC_UNSUPPORTED_CAPABILITY;
+#endif
+}
 ''')
-    (src/'exports.map').write_text('MEGUVIZ_DEV { global: mgc_*; local: *; };\n')
+    (src/'exports.map').write_text('MEGUVIZ_DEV { global: mgc_*; meguviz_code_image_anchor_v1; local: *; };\n')
     (src/'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.31)
 project(InstalledAndroidComputeConsumer LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
@@ -79,9 +88,9 @@ target_link_options(compute_closure PRIVATE "-Wl,--version-script=${CMAKE_CURREN
         if len(fields) >= 8 and fields[0].endswith(':') and fields[4] in {'GLOBAL', 'WEAK'} and fields[6] not in {'UND', 'ABS'}:
             name = fields[7].split('@')[0]
             exports.append(name)
-            if not name.startswith('mgc_'):
+            if not name.startswith('mgc_') and name != 'meguviz_code_image_anchor_v1':
                 raise RuntimeError('private symbol exported: '+name)
-    if 'mgc_test_entry' not in exports or 'mgc_runtime_create' not in exports:
+    if 'mgc_test_entry' not in exports or 'mgc_runtime_create' not in exports or 'meguviz_code_image_anchor_v1' not in exports:
         raise RuntimeError('public C ABI missing from final link')
     files = [{'path': p.relative_to(prefix).as_posix(), 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}
              for p in sorted(prefix.rglob('*')) if p.is_file()]

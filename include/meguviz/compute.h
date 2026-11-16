@@ -41,6 +41,11 @@ typedef struct MgcResource MgcResource;
 typedef struct MgcLease MgcLease;
 typedef struct MgcSession MgcSession;
 typedef struct MgcTicket MgcTicket;
+/* User-provided callbacks must not throw exceptions across this C ABI.
+ * Retain/release callbacks run without the session lock; a close during submit
+ * preparation returns BUSY. If retain throws after partial user-side work,
+ * the library cannot infer or undo that work. */
+typedef void (*MgcContextFn)(void *context);
 
 enum { MGC_PROVIDER_CPU_REFERENCE = 1, MGC_PROVIDER_NCNN_CPU = 2, MGC_PROVIDER_NCNN_VULKAN = 3 };
 enum {
@@ -54,18 +59,32 @@ enum {
     MGC_CAP_APPROVED_SHADER_PROFILE = 17
 };
 enum { MGC_ACCESS_READ = 1, MGC_ACCESS_WRITE = 2 };
+/* usage=0 is explicit host storage. GPU allocations are never CPU mapped. */
+enum { MGC_RESOURCE_GPU_BUFFER = 1, MGC_RESOURCE_ANDROID_AHB = 2 };
 enum { MGC_FORMAT_BYTES = 1, MGC_FORMAT_RGB8 = 2, MGC_FORMAT_RGBA8 = 3, MGC_FORMAT_FLOAT32 = 4 };
 enum { MGC_OPERATION_COPY = 1, MGC_OPERATION_NORMALIZE_F32 = 2, MGC_OPERATION_RESIZE_RGB8 = 3, MGC_OPERATION_STATISTICS_F32 = 4, MGC_OPERATION_RELU_F32 = 5 };
 enum { MGC_DEPENDENCY_READY = 0, MGC_DEPENDENCY_HOST_WAIT = 1, MGC_DEPENDENCY_SYNC_FD = 2 };
 enum { MGC_TERMINAL_SUCCESS = 1, MGC_TERMINAL_FAILED = 2, MGC_TERMINAL_CANCELLED = 3, MGC_TERMINAL_DEVICE_LOST = 4 };
 enum { MGC_EVENT_ACCEPTED = 1, MGC_EVENT_GPU_SUBMITTED = 2, MGC_EVENT_GPU_DEPENDENCY_READY = 3, MGC_EVENT_EXECUTION_RETIRED = 4, MGC_EVENT_OUTPUT_RELEASED = 5 };
+enum { MGC_MEASURE_GPU_TIMESTAMPS = 1 };
+typedef struct MgcBatchEvent {
+    MgcHeader header;
+    uint64_t request_id, batch_id, monotonic_ns;
+    uint32_t kind, reserved;
+} MgcBatchEvent;
+typedef void (*MgcBatchEventFn)(void *context, const MgcBatchEvent *event);
 
 typedef struct MgcRuntimeDesc {
     MgcHeader header;
     uint32_t provider;
     uint32_t required_flags;
+    /* Admission budget for registered Resource ranges, including allocator
+     * alignment (AHB conservatively uses max(row extent, allocationSize)).
+     * Private ncnn caches, commands/queries and driver memory are separate. */
     uint64_t memory_budget_bytes;
     uint32_t reserved[4];
+    uint32_t measurement_flags;
+    uint32_t measurement_reserved;
 } MgcRuntimeDesc;
 
 typedef struct MgcDomainDesc {
@@ -100,6 +119,12 @@ typedef struct MgcLeaseDesc {
     uint64_t dependency_id;
     uint32_t required_flags;
     uint32_t reserved[3];
+    /* Content lifetime, independent of a cached allocation reference. Retain
+     * once on successful creation; release after this lease's final reference.
+     * publish_read preserves the same content owner and reference accounting. */
+    void *content_context;
+    MgcContextFn retain_content;
+    MgcContextFn release_content;
 } MgcLeaseDesc;
 
 typedef struct MgcImageView {
@@ -146,6 +171,16 @@ typedef struct MgcCapability {
     int32_t reason;
     uint32_t reserved[4];
 } MgcCapability;
+/* A lost domain is never rebound to a replacement VkDevice. After service has
+ * retired/detached its old device, acquire a NEW domain/model/plan. Old handles
+ * remain valid only for diagnostics and origin-owned release. */
+typedef struct MgcDomainStateInfo {
+    MgcHeader header;
+    uint64_t domain_id, domain_generation, device_epoch;
+    uint32_t lost, device_retired, detached;
+    int32_t last_error;
+    uint32_t reserved[4];
+} MgcDomainStateInfo;
 
 typedef struct MgcCompletion {
     MgcHeader header;
@@ -156,10 +191,21 @@ typedef struct MgcCompletion {
     uint32_t host_finalized;
     uint32_t result_discarded;
     uint32_t reserved[3];
+    /* Actual worker thread CPU between job execution entry and host finalize;
+     * excludes user callback. observed=0 means unavailable, not zero CPU use. */
+    uint64_t worker_cpu_ns;
+    uint32_t worker_cpu_observed;
+    uint32_t worker_cpu_reserved;
+    uint64_t gpu_elapsed_ns;
+    uint64_t gpu_batch_count;
+    uint64_t gpu_observed_batch_count;
+    uint32_t gpu_elapsed_observed;
+    uint32_t gpu_timestamp_valid_bits;
+    uint32_t gpu_timestamp_period_bits;
+    uint32_t batch_event_coverage_observed;
 } MgcCompletion;
 
 typedef void (*MgcCompletionFn)(void *context, const MgcCompletion *completion);
-typedef void (*MgcContextFn)(void *context);
 
 typedef struct MgcSessionDesc {
     MgcHeader header;
@@ -188,7 +234,23 @@ typedef struct MgcSubmitDesc {
     MgcContextFn retain_context;
     MgcContextFn release_context;
     uint32_t reserved[4];
+    /* Bounded recorded events dispatch after execution-slot exit, before the
+     * final callback; same retained context. Overflow clears coverage flag. */
+    MgcBatchEventFn batch_event;
 } MgcSubmitDesc;
+typedef struct MgcAllocationStats {
+    MgcHeader header;
+    uint64_t domain_id;
+    uint64_t managed_live_bytes, managed_highwater_bytes, managed_live_count, managed_highwater_count;
+    uint64_t imported_live_bytes, imported_highwater_bytes, imported_live_count, imported_highwater_count;
+    uint64_t total_allocation_count;
+    uint32_t resource_ranges_observed;
+    uint32_t private_reserved_observed;
+    uint64_t private_reserved_bytes;
+    uint32_t private_live_observed;
+    uint32_t reserved;
+    uint64_t private_live_bytes;
+} MgcAllocationStats;
 
 typedef struct MgcBuildInfo {
     MgcHeader header;
@@ -197,6 +259,16 @@ typedef struct MgcBuildInfo {
     MgcHash private_sdk_fingerprint;
     MgcHash build_fingerprint;
 } MgcBuildInfo;
+typedef struct MgcExecutionInfo {
+    MgcHeader header;
+    uint64_t submitted_batches;
+    uint64_t retired_batches;
+    uint64_t finalized_batches;
+    uint64_t recording_submitted_batches;
+    uint32_t final_submit_async;
+    uint32_t full_record_async;
+    uint32_t reserved[4];
+} MgcExecutionInfo;
 
 MGC_API MgcStatus mgc_query_build_info(MgcBuildInfo *info);
 MGC_API MgcStatus mgc_runtime_create(const MgcRuntimeDesc *desc, MgcRuntime **runtime);
@@ -206,6 +278,20 @@ MGC_API void mgc_runtime_release(MgcRuntime *runtime);
 MGC_API MgcStatus mgc_runtime_close(MgcRuntime *runtime);
 MGC_API MgcStatus mgc_domain_acquire(MgcRuntime *runtime, const MgcDomainDesc *desc, MgcDomain **domain);
 MGC_API MgcStatus mgc_domain_identity(MgcDomain *domain, uint64_t *domain_id, uint64_t *generation);
+MGC_API MgcStatus mgc_domain_state(MgcDomain *domain, MgcDomainStateInfo *state);
+/* Worker service; NULL explicitly visits this module's standalone GPU owners.
+ * A zero wait uses zero-time fence queries and try-locks where possible;
+ * driver and origin-cleanup calls may still block.
+ * SUCCESS is not an assertion that caller-owned sessions/outputs are closed. */
+MGC_API MgcStatus mgc_domain_service(MgcDomain *domain, uint64_t wait_ns);
+/* Explicit opt-in, sampled per accepted ticket. Default zero emits no GPU
+ * timestamp commands. Period is raw IEEE754 float bits, not host wall time. */
+MGC_API MgcStatus mgc_domain_set_measurement_flags(MgcDomain *domain, uint32_t flags);
+/* Resource allocation ranges only; private ncnn live/reserved, command/query
+ * and driver allocations stay unknown. Counts are not total GPU/DRAM usage.
+ * Imported includes AHB Vulkan imports, even when the AHB was allocated here. */
+MGC_API MgcStatus mgc_domain_allocation_stats(MgcDomain *domain, MgcAllocationStats *stats);
+MGC_API MgcStatus mgc_runtime_allocation_stats(MgcRuntime *runtime, MgcAllocationStats *stats);
 MGC_API void mgc_domain_retain(MgcDomain *domain);
 MGC_API void mgc_domain_release(MgcDomain *domain);
 MGC_API MgcStatus mgc_domain_capability(MgcDomain *domain, uint32_t feature, MgcCapability *capability);
@@ -216,17 +302,29 @@ MGC_API MgcStatus mgc_lease_create(MgcResource *resource, const MgcLeaseDesc *de
 MGC_API void mgc_lease_retain(MgcLease *lease);
 MGC_API void mgc_lease_release(MgcLease *lease);
 MGC_API MgcStatus mgc_lease_info(MgcLease *lease, MgcLeaseInfo *info);
+/* Returns one retained origin resource reference; no lease reference moves.
+ * Reuse still requires a successful new WRITE lease and a newer content_id. */
+MGC_API MgcStatus mgc_lease_resource(MgcLease *lease, MgcResource **retained_resource);
 /* Explicit CPU mapping is unavailable for protected or GPU-only resources.
  * A successful map is borrowed until unmap; never free() its pointer. */
 MGC_API MgcStatus mgc_lease_map(MgcLease *lease, void **data, uint64_t *size_bytes);
 MGC_API MgcStatus mgc_lease_unmap(MgcLease *lease);
+/* Waits for the lease's producer dependency; timeout never consumes it. */
+MGC_API MgcStatus mgc_lease_wait_ready(MgcLease *lease, uint64_t timeout_ns);
+/* Seals a completed WRITE lease. All references to this lease become READ;
+ * returns one additional owned reference. The caller still releases its old
+ * reference. No maps or foreign in-flight submissions may exist. */
+MGC_API MgcStatus mgc_lease_publish_read(MgcLease *writing_lease, MgcLease **read_lease);
 MGC_API MgcStatus mgc_session_create(MgcDomain *domain, const MgcSessionDesc *desc, MgcSession **session);
 MGC_API MgcStatus mgc_session_close(MgcSession *session);
 MGC_API MgcStatus mgc_submit(MgcSession *session, const MgcSubmitDesc *desc, MgcTicket **ticket);
 MGC_API void mgc_ticket_retain(MgcTicket *ticket);
 MGC_API void mgc_ticket_release(MgcTicket *ticket);
+/* Cancellation requested before completion discards the result. If execution
+ * reports MGC_DEVICE_LOST, completion reports that failure even when cancelled. */
 MGC_API MgcStatus mgc_ticket_cancel(MgcTicket *ticket);
 MGC_API MgcStatus mgc_ticket_query(MgcTicket *ticket, MgcCompletion *completion);
+MGC_API MgcStatus mgc_ticket_execution_info(MgcTicket *ticket, MgcExecutionInfo *info);
 /* timeout_ns=0 polls. Timeout preserves every live object. drain waits for all
  * accepted execution, host finalize, callbacks and borrowed submission leases;
  * consumer-owned output leases are outside its scope and stay valid. */

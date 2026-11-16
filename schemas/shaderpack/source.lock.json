@@ -1,6 +1,7 @@
 {
   "owner": "MeguvizShaderTools",
   "schema_version": 1,
-  "sha256": "e18d92e7ef67961412e48c4c7774ad9fa4c3977855b1db9e81051b89691a83df",
-  "scope": "contract snapshot, no host runtime linkage"
+  "sha256": "0287bce8685622c514eeeb0fe9078c96649ab09e9b5effbfbc15bee419ea4b17",
+  "scope": "owner contract snapshot including optional bound execution metadata; no host runtime linkage",
+  "target_facts_sha256": "adf2295c43ae26a0a1eaf065a9264857c90cd34419a6a612cd4f67d98417b485"
 }

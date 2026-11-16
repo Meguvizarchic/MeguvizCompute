@@ -1,0 +1,3153 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 909c2146..887eae83 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -417,6 +417,13 @@ if(NCNN_DISABLE_EXCEPTION)
+     endif()
+ endif()
+ 
++# The exact-source recovery factory must catch CPU allocation failure after a
++# device/initialization command exists. Preserve the legacy math translation
++# units' exception options; only this device-lifetime implementation overrides.
++if(NCNN_VULKAN AND NCNN_DISABLE_EXCEPTION AND NOT MSVC)
++    set_property(SOURCE gpu.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
++endif()
++
+ if(NCNN_TARGET_ARCH STREQUAL "x86")
+     if(NCNN_SSE2)
+         if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC" OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_SIMULATE_ID MATCHES "MSVC" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT MATCHES "MSVC"))
+diff --git a/src/command.cpp b/src/command.cpp
+index dc6e9161..2abb66ba 100644
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -7,9 +7,71 @@
+ 
+ #include "option.h"
+ #include "pipeline.h"
++#include "cpu.h"
++#include <atomic>
+ 
+ namespace ncnn {
+ 
++namespace {
++struct CommandHostState {
++    bool enabled;
++    int blocktime, flush;
++    CommandHostState(bool capture, int desired_blocktime, int desired_flush) : enabled(capture), blocktime(0), flush(0) {
++        if (enabled) { blocktime = get_kmp_blocktime(); flush = get_flush_denormals(); set_kmp_blocktime(desired_blocktime); set_flush_denormals(desired_flush); }
++    }
++    ~CommandHostState() { if (enabled) { set_kmp_blocktime(blocktime); set_flush_denormals(flush); } }
++};
++}
++
++VkBatchTimestamp::VkBatchTimestamp(const VulkanDevice* d)
++    : device(d), pool(0), bits(0), period_bits(0), period(0), elapsed(0), observed(false) {}
++VkBatchTimestamp::~VkBatchTimestamp() { if (pool) vkDestroyQueryPool(device->vkdevice(), pool, 0); }
++int VkBatchTimestamp::configure(bool enabled)
++{
++    if (!enabled) return 0;
++    uint32_t count = 0; vkGetPhysicalDeviceQueueFamilyProperties(device->info.physicalDevice(), &count, 0);
++    std::vector<VkQueueFamilyProperties> queues(count);
++    if (count) vkGetPhysicalDeviceQueueFamilyProperties(device->info.physicalDevice(), &count, queues.data());
++    uint32_t family = device->info.compute_queue_family_index();
++    if (family >= count) return -1;
++    bits = queues[family].timestampValidBits;
++    period = device->info.physicalDeviceProperties().limits.timestampPeriod;
++    memcpy(&period_bits, &period, 4);
++    if (!bits || bits > 64 || (period_bits & 0x80000000u) || (period_bits & 0x7f800000u) == 0x7f800000u || !(period_bits & 0x7fffffffu)) return -1;
++    if (pool) return 0;
++    VkQueryPoolCreateInfo q = {}; q.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++    q.queryType = VK_QUERY_TYPE_TIMESTAMP; q.queryCount = 2;
++    return vkCreateQueryPool(device->vkdevice(), &q, 0, &pool) == VK_SUCCESS ? 0 : -1;
++}
++void VkBatchTimestamp::begin(VkCommandBuffer command)
++{
++    elapsed = 0; observed = false;
++    if (pool) { vkCmdResetQueryPool(command, pool, 0, 2); vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0); }
++}
++void VkBatchTimestamp::end(VkCommandBuffer command) { if (pool) vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, 1); }
++void VkBatchTimestamp::submitted() { if (pool) submit_wall = std::chrono::steady_clock::now(); }
++void VkBatchTimestamp::retired()
++{
++    observed = false; elapsed = 0;
++    if (!pool || !bits) return;
++    struct Value { uint64_t ticks, available; } values[2] = {};
++    VkResult status = vkGetQueryPoolResults(device->vkdevice(), pool, 0, 2, sizeof(values), values, sizeof(Value), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++    if (status != VK_SUCCESS || !values[0].available || !values[1].available) return;
++    const uint64_t mask = bits == 64 ? UINT64_MAX : (uint64_t(1) << bits) - 1;
++    // CPU wall is only a conservative wrap-ambiguity guard, never GPU elapsed.
++    if (bits < 64) {
++        long double wrap_ns = (static_cast<long double>(mask) + 1) * period;
++        auto upper_bound = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submit_wall).count();
++        if (upper_bound < 0 || static_cast<long double>(upper_bound) >= wrap_ns) return;
++    }
++    uint64_t ticks = ((values[1].ticks & mask) - (values[0].ticks & mask)) & mask;
++    long double ns = static_cast<long double>(ticks) * period;
++    if (ns < 0 || ns >= static_cast<long double>(UINT64_MAX)) return;
++    elapsed = static_cast<uint64_t>(ns); observed = true;
++}
++void VkBatchTimestamp::result(uint64_t* ns, uint32_t* valid, uint32_t* valid_bits, uint32_t* pbits) const
++{ *ns = elapsed; *valid = observed ? 1 : 0; *valid_bits = bits; *pbits = period_bits; }
++
+ class VkComputePrivate
+ {
+ public:
+@@ -19,6 +81,10 @@ public:
+     int init();
+     int begin_command_buffer();
+     int end_command_buffer();
++    void release_record_payloads();
++    void snapshot(const VkMat& mat);
++    void snapshot(const VkImageMat& mat);
++    void restore_record_state();
+ 
+     const VulkanDevice* vkdev;
+ 
+@@ -32,6 +98,24 @@ public:
+     std::vector<VkMat> download_post_buffers;
+     std::vector<Mat> download_post_mats_fp16;
+     std::vector<Mat> download_post_mats;
++    // Managed commands retain buffer/image values across user stack unwinding.
++    // Raw Pipeline and allocator owners remain the caller's responsibility.
++    std::vector<VkMat> managed_buffers;
++    std::vector<VkImageMat> managed_images;
++    std::vector<Mat> managed_hosts;
++    // Direct Android YCbCr pipelines are not owned by PipelineCache. Keep
++    // their Vulkan objects alive for the entire recorded command lifetime.
++    std::vector<std::shared_ptr<void> > direct_pipeline_owners;
++    struct BufferState {
++        VkMat mat; VkAccessFlags access; VkPipelineStageFlags stage;
++        explicit BufferState(const VkMat& value) : mat(value), access(value.data->access_flags), stage(value.data->stage_flags) {}
++    };
++    struct ImageState {
++        VkImageMat mat; VkAccessFlags access; VkImageLayout layout; VkPipelineStageFlags stage;
++        explicit ImageState(const VkImageMat& value) : mat(value), access(value.data->access_flags), layout(value.data->image_layout), stage(value.data->stage_flags) {}
++    };
++    std::vector<BufferState> buffer_states;
++    std::vector<ImageState> image_states;
+ 
+     std::vector<VkImageMemory*> image_blocks_to_destroy;
+ 
+@@ -171,12 +255,16 @@ public:
+                 uint32_t download_post_mat_fp16_offset;
+                 uint32_t download_post_mat_offset;
+                 int num_threads;
++                bool capture_host_state;
++                int openmp_blocktime, flush_denormals;
+             } post_cast_float16_to_float32;
+             struct
+             {
+                 uint32_t download_post_mat_bf16_offset;
+                 uint32_t download_post_mat_offset;
+                 int num_threads;
++                bool capture_host_state;
++                int openmp_blocktime, flush_denormals;
+             } post_cast_bfloat16_to_float32;
+         };
+     };
+@@ -184,6 +272,25 @@ public:
+     std::vector<record> delayed_records;
+ 
+     uint64_t pending_dispatch_total;
++    int submission_state;
++    bool valid;
++    bool retirement_managed;
++    bool uncertain_submit;
++    bool observed_submit;
++    bool recording_started;
++    bool discarded;
++    uint64_t wait_budget_ns;
++    VkResult submit_result;
++    VkResult wait_result;
++    VkResult operation_result;
++    int finalize_status;
++    uint64_t submitted_batches;
++    uint64_t finalized_batches;
++    void (*submit_observer)(void*, uint64_t, uint32_t);
++    void* observer_context;
++    VkBatchTimestamp* measurement;
++    void (*timestamp_observer)(void*, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t);
++    void* timestamp_context;
+ 
+ #if NCNN_BENCHMARK
+     uint32_t query_count;
+@@ -199,17 +306,33 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
+     compute_command_fence = 0;
+ 
+     pending_dispatch_total = 0;
++    submission_state = 0;
++    valid = false;
++    retirement_managed = false;
++    uncertain_submit = observed_submit = false;
++    recording_started = false;
++    discarded = false;
++    wait_budget_ns = UINT64_MAX;
++    submit_result = wait_result = VK_NOT_READY;
++    operation_result = VK_SUCCESS;
++    finalize_status = -1;
++    submitted_batches = finalized_batches = 0;
++    submit_observer = 0;
++    observer_context = 0;
++    measurement = 0; timestamp_observer = 0; timestamp_context = 0;
+ 
+ #if NCNN_BENCHMARK
+     query_count = 0;
+     query_pool = 0;
+ #endif // NCNN_BENCHMARK
+ 
+-    init();
++    valid = init() == 0;
+ }
+ 
+ VkComputePrivate::~VkComputePrivate()
+ {
++    release_record_payloads();
++    delete measurement;
+     for (size_t i = 0; i < image_blocks_to_destroy.size(); i++)
+     {
+         VkImageMemory* ptr = image_blocks_to_destroy[i];
+@@ -249,10 +372,54 @@ VkComputePrivate::~VkComputePrivate()
+     }
+ #endif // NCNN_BENCHMARK
+ 
+-    vkDestroyFence(vkdev->vkdevice(), compute_command_fence, 0);
++    if (compute_command_fence) vkDestroyFence(vkdev->vkdevice(), compute_command_fence, 0);
++
++    if (compute_command_pool && compute_command_buffer) vkFreeCommandBuffers(vkdev->vkdevice(), compute_command_pool, 1, &compute_command_buffer);
++    if (compute_command_pool) vkDestroyCommandPool(vkdev->vkdevice(), compute_command_pool, 0);
++}
++
++void VkComputePrivate::snapshot(const VkMat& mat)
++{
++    if (!retirement_managed || mat.empty()) return;
++    for (size_t i = 0; i < buffer_states.size(); i++) if (buffer_states[i].mat.data == mat.data) return;
++    buffer_states.push_back(BufferState(mat));
++}
++void VkComputePrivate::snapshot(const VkImageMat& mat)
++{
++    if (!retirement_managed || mat.empty()) return;
++    for (size_t i = 0; i < image_states.size(); i++) if (image_states[i].mat.data == mat.data) return;
++    image_states.push_back(ImageState(mat));
++}
++void VkComputePrivate::restore_record_state()
++{
++    for (size_t i = 0; i < buffer_states.size(); i++) {
++        buffer_states[i].mat.data->access_flags = buffer_states[i].access;
++        buffer_states[i].mat.data->stage_flags = buffer_states[i].stage;
++    }
++    for (size_t i = 0; i < image_states.size(); i++) {
++        image_states[i].mat.data->access_flags = image_states[i].access;
++        image_states[i].mat.data->image_layout = image_states[i].layout;
++        image_states[i].mat.data->stage_flags = image_states[i].stage;
++    }
++    buffer_states.clear(); image_states.clear();
++}
+ 
+-    vkFreeCommandBuffers(vkdev->vkdevice(), compute_command_pool, 1, &compute_command_buffer);
+-    vkDestroyCommandPool(vkdev->vkdevice(), compute_command_pool, 0);
++void VkComputePrivate::release_record_payloads()
++{
++    for (size_t i = 0; i < delayed_records.size(); i++) {
++        record& r = delayed_records[i];
++        switch (r.type) {
++        case record::TYPE_copy_buffer: delete[] r.copy_buffer.regions; r.copy_buffer.regions = 0; break;
++        case record::TYPE_copy_image: delete[] r.copy_image.regions; r.copy_image.regions = 0; break;
++        case record::TYPE_copy_buffer_to_image: delete[] r.copy_buffer_to_image.regions; r.copy_buffer_to_image.regions = 0; break;
++        case record::TYPE_copy_image_to_buffer: delete[] r.copy_image_to_buffer.regions; r.copy_image_to_buffer.regions = 0; break;
++        case record::TYPE_push_constants: delete[] (unsigned char*)r.push_constants.values; r.push_constants.values = 0; break;
++        case record::TYPE_memory_barrers: delete[] r.memory_barrers.barriers; r.memory_barrers.barriers = 0; break;
++        case record::TYPE_buffer_barrers: delete[] r.buffer_barrers.barriers; r.buffer_barrers.barriers = 0; break;
++        case record::TYPE_image_barrers: delete[] r.image_barrers.barriers; r.image_barrers.barriers = 0; break;
++        default: break;
++        }
++    }
+ }
+ 
+ int VkComputePrivate::init()
+@@ -265,12 +432,15 @@ int VkComputePrivate::init()
+         commandPoolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+         commandPoolCreateInfo.queueFamilyIndex = vkdev->info.compute_queue_family_index();
+ 
+-        VkResult ret = vkCreateCommandPool(vkdev->vkdevice(), &commandPoolCreateInfo, 0, &compute_command_pool);
++        VkCommandPool created_pool = 0;
++        VkResult ret = vkCreateCommandPool(vkdev->vkdevice(), &commandPoolCreateInfo, 0, &created_pool);
++        operation_result = ret;
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkCreateCommandPool failed %d", ret);
+             return -1;
+         }
++        compute_command_pool = created_pool;
+     }
+ 
+     // compute_command_buffer
+@@ -282,12 +452,15 @@ int VkComputePrivate::init()
+         commandBufferAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+         commandBufferAllocateInfo.commandBufferCount = 1;
+ 
+-        VkResult ret = vkAllocateCommandBuffers(vkdev->vkdevice(), &commandBufferAllocateInfo, &compute_command_buffer);
++        VkCommandBuffer created_buffer = 0;
++        VkResult ret = vkAllocateCommandBuffers(vkdev->vkdevice(), &commandBufferAllocateInfo, &created_buffer);
++        operation_result = ret;
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkAllocateCommandBuffers failed %d", ret);
+             return -1;
+         }
++        compute_command_buffer = created_buffer;
+     }
+ 
+     // compute_command_fence
+@@ -297,17 +470,20 @@ int VkComputePrivate::init()
+         fenceCreateInfo.pNext = 0;
+         fenceCreateInfo.flags = 0;
+ 
+-        VkResult ret = vkCreateFence(vkdev->vkdevice(), &fenceCreateInfo, 0, &compute_command_fence);
++        VkFence created_fence = 0;
++        VkResult ret = vkCreateFence(vkdev->vkdevice(), &fenceCreateInfo, 0, &created_fence);
++        operation_result = ret;
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkCreateFence failed %d", ret);
+             return -1;
+         }
++        compute_command_fence = created_fence;
+     }
+ 
+     if (vkdev->info.support_VK_KHR_push_descriptor())
+     {
+-        begin_command_buffer();
++        if (begin_command_buffer() != 0) return -1;
+ 
+ #if NCNN_BENCHMARK
+         if (query_pool)
+@@ -327,12 +503,14 @@ int VkComputePrivate::begin_command_buffer()
+     commandBufferBeginInfo.pInheritanceInfo = 0;
+ 
+     VkResult ret = vkBeginCommandBuffer(compute_command_buffer, &commandBufferBeginInfo);
++    operation_result = ret;
+     if (ret != VK_SUCCESS)
+     {
+         NCNN_LOGE("vkBeginCommandBuffer failed %d", ret);
+         return -1;
+     }
+ 
++    if (measurement) measurement->begin(compute_command_buffer);
+     return 0;
+ }
+ 
+@@ -341,7 +519,9 @@ int VkComputePrivate::end_command_buffer()
+ #if NCNN_COVERAGE
+     vkdev->record_shader_coverage_barrier(compute_command_buffer);
+ #endif
++    if (measurement) measurement->end(compute_command_buffer);
+     VkResult ret = vkEndCommandBuffer(compute_command_buffer);
++    operation_result = ret;
+     if (ret != VK_SUCCESS)
+     {
+         NCNN_LOGE("vkEndCommandBuffer failed %d", ret);
+@@ -358,11 +538,67 @@ VkCompute::VkCompute(const VulkanDevice* _vkdev)
+ 
+ VkCompute::~VkCompute()
+ {
++    if (d->retirement_managed && (d->submission_state == 0 || d->submission_state == 1)) discard_unsubmitted();
++    if (!compute_batches_retired()) {
++        if (!d->retirement_managed) wait((uint64_t)-1);
++        if (!compute_batches_retired()) {
++            // Contract violation: a managed lifecycle owner must not destroy
++            // this object yet. Keep command state rather than free in-use GPU
++            // objects. This fallback is not an orphan/device lifetime owner.
++            NCNN_LOGE("VkCompute destroyed before retirement; private state retained");
++            return;
++        }
++    }
++    if (d->submission_state == 3) host_finalize();
+     delete d;
+ }
++bool VkCompute::is_valid() const { return d->valid; }
++int VkCompute::set_retirement_managed(uint64_t wait_ns) {
++    if (!d->valid || d->discarded || d->submission_state != 0 || d->recording_started || d->pending_dispatch_total || d->submitted_batches ||
++        wait_ns > 100000000 || !d->delayed_records.empty() || !d->upload_staging_buffers.empty()) return -1;
++    d->retirement_managed = true; d->wait_budget_ns = wait_ns; return 0;
++}
++bool VkCompute::compute_batches_retired() const { return d->submission_state != 2 && d->submission_state != 5; }
++int VkCompute::execution_state() const { return d->submission_state; }
++bool VkCompute::submission_uncertain() const { return d->uncertain_submit; }
++VkResult VkCompute::last_submit_result() const { return d->submit_result; }
++VkResult VkCompute::last_wait_result() const { return d->wait_result; }
++VkResult VkCompute::last_operation_result() const { return d->operation_result; }
++int VkCompute::wait_compute_retirement(uint64_t timeout_ns) {
++    return compute_batches_retired() ? 0 : wait(timeout_ns);
++}
++int VkCompute::retire_device_lost()
++{
++    // The owning device coordinator supplies the all-queues quiescence proof.
++    // Do not restore pre-loss metadata: external contents/layout are undefined.
++    // Claim failed finalization before dropping records so neither an explicit
++    // retry nor the destructor can apply delayed host copies after the loss.
++    d->valid = false;
++    d->discarded = true;
++    d->uncertain_submit = true;
++    d->submission_state = 4;
++    d->finalize_status = -1;
++    d->pending_dispatch_total = 0;
++    d->release_record_payloads();
++    d->delayed_records.clear();
++    return 0;
++}
++int VkCompute::discard_unsubmitted() {
++    if (!d->retirement_managed || (d->submission_state != 0 && d->submission_state != 1)) return -1;
++    d->restore_record_state();
++    d->discarded = true;
++    return 0;
++}
++bool VkCompute::recording_allowed() const {
++    if (!d->valid || d->discarded || d->submission_state != 0) return false;
++    d->recording_started = true;
++    return true;
++}
+ 
+ void VkCompute::record_upload(const Mat& src, VkMat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    if (d->retirement_managed) d->managed_hosts.push_back(src);
+     // NCNN_LOGE("record_upload buffer");
+ 
+     Mat src_fp16;
+@@ -444,6 +680,9 @@ void VkCompute::record_upload(const Mat& src, VkMat& dst, const Option& opt)
+ 
+ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    d->snapshot(src);
++    if (d->retirement_managed) d->managed_buffers.push_back(src);
+     // NCNN_LOGE("record_download buffer");
+ 
+     // resolve dst_elempack
+@@ -485,6 +724,7 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+     vkdev->convert_packing(src, dst_staging, dst_elempack, cast_type_to, *this, opt_staging);
+ 
+     // barrier device any @ compute to host-read @ compute
++    d->snapshot(dst_staging);
+     if (dst_staging.data->access_flags & VK_ACCESS_HOST_WRITE_BIT || dst_staging.data->stage_flags != VK_PIPELINE_STAGE_HOST_BIT)
+     {
+         VkBufferMemoryBarrier* barriers = new VkBufferMemoryBarrier[1];
+@@ -566,6 +806,9 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+             r.post_cast_bfloat16_to_float32.download_post_mat_bf16_offset = d->download_post_mats_fp16.size() - 1;
+             r.post_cast_bfloat16_to_float32.download_post_mat_offset = d->download_post_mats.size() - 1;
+             r.post_cast_bfloat16_to_float32.num_threads = opt.num_threads;
++            r.post_cast_bfloat16_to_float32.capture_host_state = d->retirement_managed;
++            r.post_cast_bfloat16_to_float32.openmp_blocktime = get_kmp_blocktime();
++            r.post_cast_bfloat16_to_float32.flush_denormals = get_flush_denormals();
+             d->delayed_records.push_back(r);
+         }
+         else if (vkdev->info.type() == 0 && (opt.use_fp16_storage || opt.use_fp16_packed))
+@@ -588,6 +831,9 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+             r.post_cast_float16_to_float32.download_post_mat_fp16_offset = d->download_post_mats_fp16.size() - 1;
+             r.post_cast_float16_to_float32.download_post_mat_offset = d->download_post_mats.size() - 1;
+             r.post_cast_float16_to_float32.num_threads = opt.num_threads;
++            r.post_cast_float16_to_float32.capture_host_state = d->retirement_managed;
++            r.post_cast_float16_to_float32.openmp_blocktime = get_kmp_blocktime();
++            r.post_cast_float16_to_float32.flush_denormals = get_flush_denormals();
+             d->delayed_records.push_back(r);
+         }
+         else
+@@ -603,6 +849,8 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+ 
+ void VkCompute::record_clone(const Mat& src, VkMat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    if (d->retirement_managed) d->managed_hosts.push_back(src);
+     //     NCNN_LOGE("record_clone host to buffer");
+ 
+     // host to staging
+@@ -633,6 +881,8 @@ void VkCompute::record_clone(const Mat& src, VkMat& dst, const Option& opt)
+ 
+ void VkCompute::record_clone(const Mat& src, VkImageMat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    if (d->retirement_managed) d->managed_hosts.push_back(src);
+     //     NCNN_LOGE("record_clone host to image");
+ 
+     // host to staging
+@@ -650,6 +900,9 @@ void VkCompute::record_clone(const Mat& src, VkImageMat& dst, const Option& opt)
+ 
+ void VkCompute::record_clone(const VkMat& src, Mat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    d->snapshot(src);
++    if (d->retirement_managed) d->managed_buffers.push_back(src);
+     //     NCNN_LOGE("record_clone buffer to host");
+ 
+     if (!src.allocator->mappable)
+@@ -670,6 +923,7 @@ void VkCompute::record_clone(const VkMat& src, Mat& dst, const Option& opt)
+     dst.create_like(src, opt.blob_allocator);
+     if (dst.empty())
+         return;
++    if (d->retirement_managed) d->managed_hosts.push_back(dst);
+ 
+     // barrier device any @ compute to host-read @ compute
+     if (src.data->access_flags & VK_ACCESS_HOST_WRITE_BIT || src.data->stage_flags != VK_PIPELINE_STAGE_HOST_BIT)
+@@ -727,6 +981,9 @@ void VkCompute::record_clone(const VkMat& src, Mat& dst, const Option& opt)
+ 
+ void VkCompute::record_clone(const VkImageMat& src, Mat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    d->snapshot(src);
++    if (d->retirement_managed) d->managed_images.push_back(src);
+     //     NCNN_LOGE("record_clone image to host");
+ 
+     // image to staging
+@@ -741,12 +998,17 @@ void VkCompute::record_clone(const VkImageMat& src, Mat& dst, const Option& opt)
+ 
+ void VkCompute::record_clone(const VkMat& src, VkMat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    d->snapshot(src);
++    if (d->retirement_managed) d->managed_buffers.push_back(src);
+     //     NCNN_LOGE("record_clone buffer to buffer");
+ 
+     // create dst
+     dst.create_like(src, opt.blob_vkallocator);
+     if (dst.empty())
+         return;
++    d->snapshot(dst);
++    if (d->retirement_managed) d->managed_buffers.push_back(dst);
+ 
+     if (src.data->access_flags & VK_ACCESS_TRANSFER_WRITE_BIT || src.data->stage_flags != VK_PIPELINE_STAGE_TRANSFER_BIT)
+     {
+@@ -823,12 +1085,17 @@ void VkCompute::record_clone(const VkMat& src, VkMat& dst, const Option& opt)
+ 
+ void VkCompute::record_clone(const VkImageMat& src, VkImageMat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    d->snapshot(src);
++    if (d->retirement_managed) d->managed_images.push_back(src);
+     //     NCNN_LOGE("record_clone image to image");
+ 
+     // create dst
+     dst.create_like(src, opt.blob_vkallocator);
+     if (dst.empty())
+         return;
++    d->snapshot(dst);
++    if (d->retirement_managed) d->managed_images.push_back(dst);
+ 
+     // image layout transform any @ any to transfer-src-optimal @ compute
+     if (src.data->access_flags & VK_ACCESS_TRANSFER_WRITE_BIT || src.data->image_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || src.data->stage_flags != VK_PIPELINE_STAGE_TRANSFER_BIT)
+@@ -969,12 +1236,17 @@ void VkCompute::record_clone(const VkImageMat& src, VkImageMat& dst, const Optio
+ 
+ void VkCompute::record_clone(const VkMat& src, VkImageMat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    d->snapshot(src);
++    if (d->retirement_managed) d->managed_buffers.push_back(src);
+     //     NCNN_LOGE("record_clone buffer to image");
+ 
+     // create dst
+     dst.create_like(src, opt.blob_vkallocator);
+     if (dst.empty())
+         return;
++    d->snapshot(dst);
++    if (d->retirement_managed) d->managed_images.push_back(dst);
+ 
+     // barrier device any @ any to transfer-read @ compute
+     if (src.data->access_flags & VK_ACCESS_SHADER_WRITE_BIT || src.data->stage_flags != VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+@@ -1129,12 +1401,17 @@ void VkCompute::record_clone(const VkMat& src, VkImageMat& dst, const Option& op
+ 
+ void VkCompute::record_clone(const VkImageMat& src, VkMat& dst, const Option& opt)
+ {
++    if (!recording_allowed()) return;
++    d->snapshot(src);
++    if (d->retirement_managed) d->managed_images.push_back(src);
+     //     NCNN_LOGE("record_clone image to buffer");
+ 
+     // create dst
+     dst.create_like(src, opt.blob_vkallocator);
+     if (dst.empty())
+         return;
++    d->snapshot(dst);
++    if (d->retirement_managed) d->managed_buffers.push_back(dst);
+ 
+     // image layout transform any @ any to transfer-src-optimal @ compute
+     if (src.data->access_flags & VK_ACCESS_TRANSFER_WRITE_BIT || src.data->image_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || src.data->stage_flags != VK_PIPELINE_STAGE_TRANSFER_BIT)
+@@ -1283,6 +1560,13 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+ 
+ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMat>& buffer_bindings, const std::vector<VkImageMat>& image_bindings, const std::vector<vk_constant_type>& constants, const Mat& dispatcher)
+ {
++    if (!recording_allowed()) return;
++    for (size_t i = 0; i < buffer_bindings.size(); i++) d->snapshot(buffer_bindings[i]);
++    for (size_t i = 0; i < image_bindings.size(); i++) d->snapshot(image_bindings[i]);
++    if (d->retirement_managed) {
++        for (size_t i = 0; i < buffer_bindings.size(); i++) d->managed_buffers.push_back(buffer_bindings[i]);
++        for (size_t i = 0; i < image_bindings.size(); i++) d->managed_images.push_back(image_bindings[i]);
++    }
+     //     NCNN_LOGE("record_pipeline %p", pipeline);
+ 
+     const int buffer_binding_count = (int)buffer_bindings.size();
+@@ -1624,6 +1908,7 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
+ #if NCNN_BENCHMARK
+ void VkCompute::record_write_timestamp(uint32_t query)
+ {
++    if (!recording_allowed()) return;
+     if (vkdev->info.support_VK_KHR_push_descriptor())
+     {
+         if (d->query_pool)
+@@ -1644,6 +1929,13 @@ void VkCompute::record_write_timestamp(uint32_t query)
+ #if __ANDROID_API__ >= 26
+ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwareBufferPipeline* pipeline, const VkImageMat& src, const VkMat& dst)
+ {
++    if (!recording_allowed()) return;
++    if (!pipeline) { d->valid=false; return; }
++    const std::shared_ptr<void> owner = pipeline->direct_resource_owner();
++    if (!owner) { d->valid=false; return; }
++    d->direct_pipeline_owners.push_back(owner);
++    d->snapshot(src); d->snapshot(dst);
++    if (d->retirement_managed) { d->managed_images.push_back(src); d->managed_buffers.push_back(dst); }
+     // image layout transform undefined @ null to general @ compute
+     {
+         VkImageMemoryBarrier* barriers = new VkImageMemoryBarrier[1];
+@@ -1871,13 +2163,15 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
+ #endif // __ANDROID_API__ >= 26
+ #endif // NCNN_PLATFORM_API
+ 
+-int VkCompute::submit_and_wait()
++int VkCompute::seal()
+ {
++    if (!d->valid || d->discarded) return -1;
++    if (d->submission_state != 0) return d->submission_state == 1 ? 0 : -1;
+     //     NCNN_LOGE("submit_and_wait");
+ 
+     if (!vkdev->info.support_VK_KHR_push_descriptor())
+     {
+-        d->begin_command_buffer();
++        if (d->begin_command_buffer() != 0) { d->valid = false; return -1; }
+ 
+ #if NCNN_BENCHMARK
+         if (d->query_pool)
+@@ -1889,7 +2183,7 @@ int VkCompute::submit_and_wait()
+         // handle delayed records
+         for (size_t i = 0; i < record_count; i++)
+         {
+-            const VkComputePrivate::record& r = d->delayed_records[i];
++            VkComputePrivate::record& r = d->delayed_records[i];
+ 
+             switch (r.type)
+             {
+@@ -1897,24 +2191,28 @@ int VkCompute::submit_and_wait()
+             {
+                 vkCmdCopyBuffer(r.command_buffer, r.copy_buffer.src, r.copy_buffer.dst, r.copy_buffer.region_count, r.copy_buffer.regions);
+                 delete[] r.copy_buffer.regions;
++                r.copy_buffer.regions = 0;
+                 break;
+             }
+             case VkComputePrivate::record::TYPE_copy_image:
+             {
+                 vkCmdCopyImage(r.command_buffer, r.copy_image.src, r.copy_image.src_layout, r.copy_image.dst, r.copy_image.dst_layout, r.copy_image.region_count, r.copy_image.regions);
+                 delete[] r.copy_image.regions;
++                r.copy_image.regions = 0;
+                 break;
+             }
+             case VkComputePrivate::record::TYPE_copy_buffer_to_image:
+             {
+                 vkCmdCopyBufferToImage(r.command_buffer, r.copy_buffer_to_image.src, r.copy_buffer_to_image.dst, r.copy_buffer_to_image.layout, r.copy_buffer_to_image.region_count, r.copy_buffer_to_image.regions);
+                 delete[] r.copy_buffer_to_image.regions;
++                r.copy_buffer_to_image.regions = 0;
+                 break;
+             }
+             case VkComputePrivate::record::TYPE_copy_image_to_buffer:
+             {
+                 vkCmdCopyImageToBuffer(r.command_buffer, r.copy_image_to_buffer.src, r.copy_image_to_buffer.layout, r.copy_image_to_buffer.dst, r.copy_image_to_buffer.region_count, r.copy_image_to_buffer.regions);
+                 delete[] r.copy_image_to_buffer.regions;
++                r.copy_image_to_buffer.regions = 0;
+                 break;
+             }
+             case VkComputePrivate::record::TYPE_bind_pipeline:
+@@ -1934,6 +2232,7 @@ int VkCompute::submit_and_wait()
+             {
+                 vkCmdPushConstants(r.command_buffer, r.push_constants.pipeline_layout, r.push_constants.stage_flags, 0, r.push_constants.size, r.push_constants.values);
+                 delete[](unsigned char*) r.push_constants.values;
++                r.push_constants.values = 0;
+                 break;
+             }
+             case VkComputePrivate::record::TYPE_dispatch:
+@@ -1945,18 +2244,21 @@ int VkCompute::submit_and_wait()
+             {
+                 vkCmdPipelineBarrier(r.command_buffer, r.memory_barrers.src_stage, r.memory_barrers.dst_stage, 0, r.memory_barrers.barrier_count, r.memory_barrers.barriers, 0, 0, 0, 0);
+                 delete[] r.memory_barrers.barriers;
++                r.memory_barrers.barriers = 0;
+                 break;
+             }
+             case VkComputePrivate::record::TYPE_buffer_barrers:
+             {
+                 vkCmdPipelineBarrier(r.command_buffer, r.buffer_barrers.src_stage, r.buffer_barrers.dst_stage, 0, 0, 0, r.buffer_barrers.barrier_count, r.buffer_barrers.barriers, 0, 0);
+                 delete[] r.buffer_barrers.barriers;
++                r.buffer_barrers.barriers = 0;
+                 break;
+             }
+             case VkComputePrivate::record::TYPE_image_barrers:
+             {
+                 vkCmdPipelineBarrier(r.command_buffer, r.image_barrers.src_stage, r.image_barrers.dst_stage, 0, 0, 0, 0, 0, r.image_barrers.barrier_count, r.image_barrers.barriers);
+                 delete[] r.image_barrers.barriers;
++                r.image_barrers.barriers = 0;
+                 break;
+             }
+ #if NCNN_BENCHMARK
+@@ -1978,14 +2280,27 @@ int VkCompute::submit_and_wait()
+ 
+     // end command buffer
+     {
+-        d->end_command_buffer();
++        if (d->end_command_buffer() != 0) { d->valid = false; return -1; }
+     }
+ 
++    d->submission_state = 1;
++    return 0;
++}
++
++int VkCompute::submit_async(uint32_t wait_count, const VkSemaphore* waits,
++                           const VkPipelineStageFlags* stages,
++                           uint32_t signal_count, const VkSemaphore* signals)
++{
++    if (!d->valid || d->discarded) return -1;
++    if (d->submission_state == 0 && seal() != 0) { d->submit_result = d->operation_result; return -1; }
++    if (d->submission_state != 1 || (wait_count && (!waits || !stages)) ||
++        (signal_count && !signals)) return -1;
+     // acquire queue and reclaim on return
+     VkQueue compute_queue = vkdev->acquire_queue(vkdev->info.compute_queue_family_index());
+     if (compute_queue == 0)
+     {
+         NCNN_LOGE("out of compute queue");
++        d->submit_result = VK_NOT_READY;
+         return -1;
+     }
+ 
+@@ -1994,34 +2309,76 @@ int VkCompute::submit_and_wait()
+         VkSubmitInfo submitInfo;
+         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+         submitInfo.pNext = 0;
+-        submitInfo.waitSemaphoreCount = 0;
+-        submitInfo.pWaitSemaphores = 0;
+-        submitInfo.pWaitDstStageMask = 0;
++        submitInfo.waitSemaphoreCount = wait_count;
++        submitInfo.pWaitSemaphores = waits;
++        submitInfo.pWaitDstStageMask = stages;
+         submitInfo.commandBufferCount = 1;
+         submitInfo.pCommandBuffers = &d->compute_command_buffer;
+-        submitInfo.signalSemaphoreCount = 0;
+-        submitInfo.pSignalSemaphores = 0;
++        submitInfo.signalSemaphoreCount = signal_count;
++        submitInfo.pSignalSemaphores = signals;
+ 
++        if (d->measurement) d->measurement->submitted();
+         VkResult ret = vkQueueSubmit(compute_queue, 1, &submitInfo, d->compute_command_fence);
++        d->submit_result = ret;
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkQueueSubmit failed %d", ret);
+             vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
++            if (ret != VK_ERROR_OUT_OF_HOST_MEMORY && ret != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++                // Only explicit OOM guarantees no change to command resources.
++                // Every other error leaves a possibly submitted fresh fence.
++                d->submission_state = 5;
++                d->uncertain_submit = true;
++            }
+             return -1;
+         }
+     }
+ 
+     vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+ 
+-    // wait
+-    {
+-        VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence, VK_TRUE, (uint64_t)-1);
+-        if (ret != VK_SUCCESS)
+-        {
+-            NCNN_LOGE("vkWaitForFences failed %d", ret);
+-            return -1;
+-        }
+-    }
++    d->submission_state = 2;
++    d->uncertain_submit = false;
++    d->observed_submit = true;
++    ++d->submitted_batches;
++    if (d->submit_observer) d->submit_observer(d->observer_context, d->submitted_batches, 1);
++    return 0;
++}
++
++int VkCompute::poll() { return wait(0); }
++
++int VkCompute::wait(uint64_t timeout_ns)
++{
++    if (d->submission_state == 3 || d->submission_state == 4) return 0;
++    if (d->submission_state != 2 && d->submission_state != 5) return -1;
++    if (d->retirement_managed && timeout_ns > d->wait_budget_ns) timeout_ns = d->wait_budget_ns;
++    VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence, VK_TRUE, timeout_ns);
++    d->wait_result = ret;
++    if (ret == VK_TIMEOUT || ret == VK_NOT_READY) return 1;
++    if (ret != VK_SUCCESS) return -1;
++    d->submission_state = 3;
++    if (d->measurement && d->observed_submit) {
++        d->measurement->retired();
++        uint64_t ns = 0; uint32_t observed = 0, bits = 0, period = 0;
++        d->measurement->result(&ns, &observed, &bits, &period);
++        if (d->timestamp_observer) d->timestamp_observer(d->timestamp_context, d->submitted_batches, ns, observed, bits, period);
++    }
++    // Unknown-submit retirement is not evidence that a successful submit was
++    // observed. Keep the uncertainty diagnostic and do not fabricate its event.
++    if (d->observed_submit && d->submit_observer) d->submit_observer(d->observer_context, d->submitted_batches, 2);
++    return 0;
++}
++
++int VkCompute::host_finalize()
++{
++    if (d->submission_state == 4) return d->finalize_status;
++    if (d->submission_state != 3) return -1;
++    // Claim finalization before any host operation. An error/exception may
++    // leave failed output, but must never replay already-applied host records.
++    d->submission_state = 4;
++    d->finalize_status = -1;
++    // A successful later fence wait proves retirement of an uncertain submit,
++    // but not valid output after the submit error. Discard delayed host copies.
++    if (d->uncertain_submit) return -1;
+ 
+     // handle delayed post records
+     for (size_t i = 0; i < d->delayed_records.size(); i++)
+@@ -2053,10 +2410,12 @@ int VkCompute::submit_and_wait()
+             const Mat& src = d->download_post_mats_fp16[r.post_cast_float16_to_float32.download_post_mat_fp16_offset];
+             Mat& dst = d->download_post_mats[r.post_cast_float16_to_float32.download_post_mat_offset];
+ 
++            CommandHostState host_state(r.post_cast_float16_to_float32.capture_host_state, r.post_cast_float16_to_float32.openmp_blocktime, r.post_cast_float16_to_float32.flush_denormals);
+             Option opt;
+             opt.num_threads = r.post_cast_float16_to_float32.num_threads;
+             opt.blob_allocator = dst.allocator;
+             ncnn::cast_float16_to_float32(src, dst, opt);
++            if (!src.empty() && dst.empty()) return -1;
+             break;
+         }
+         case VkComputePrivate::record::TYPE_post_cast_bfloat16_to_float32:
+@@ -2066,10 +2425,12 @@ int VkCompute::submit_and_wait()
+             const Mat& src = d->download_post_mats_fp16[r.post_cast_bfloat16_to_float32.download_post_mat_bf16_offset];
+             Mat& dst = d->download_post_mats[r.post_cast_bfloat16_to_float32.download_post_mat_offset];
+ 
++            CommandHostState host_state(r.post_cast_bfloat16_to_float32.capture_host_state, r.post_cast_bfloat16_to_float32.openmp_blocktime, r.post_cast_bfloat16_to_float32.flush_denormals);
+             Option opt;
+             opt.num_threads = r.post_cast_bfloat16_to_float32.num_threads;
+             opt.blob_allocator = dst.allocator;
+             ncnn::cast_bfloat16_to_float32(src, dst, opt);
++            if (!src.empty() && dst.empty()) return -1;
+             break;
+         }
+         default:
+@@ -2080,16 +2441,48 @@ int VkCompute::submit_and_wait()
+     d->delayed_records.clear();
+ 
+     d->pending_dispatch_total = 0;
+-
++    d->submission_state = 4;
++    ++d->finalized_batches;
++    if (d->submit_observer) d->submit_observer(d->observer_context, d->submitted_batches, 3);
++    d->finalize_status = 0;
+     return 0;
+ }
+ 
++int VkCompute::submit_and_wait()
++{
++    if (submit_async() != 0 || wait(d->wait_budget_ns) != 0) return -1;
++    return host_finalize();
++}
++
++void VkCompute::set_submit_observer(void (*observer)(void*, uint64_t, uint32_t), void* context)
++{ d->submit_observer = observer; d->observer_context = context; }
++uint64_t VkCompute::submitted_batch_count() const { return d->submitted_batches; }
++uint64_t VkCompute::finalized_batch_count() const { return d->finalized_batches; }
++int VkCompute::enable_gpu_timestamps(bool enabled)
++{
++    if (!d->valid || d->submission_state != 0 || d->pending_dispatch_total) return -1;
++    if (!enabled) return d->measurement ? -1 : 0;
++    if (d->measurement) return -1; // configure once, before any recording
++    d->measurement = new VkBatchTimestamp(vkdev);
++    int status = d->measurement->configure(true);
++    if (vkdev->info.support_VK_KHR_push_descriptor()) { d->recording_started = true; d->measurement->begin(d->compute_command_buffer); }
++    return status;
++}
++void VkCompute::set_gpu_timestamp_observer(void (*observer)(void*, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t), void* context)
++{ d->timestamp_observer = observer; d->timestamp_context = context; }
++
+ int VkCompute::reset()
+ {
++    if (!d->valid || (d->submission_state != 0 && d->submission_state != 4 && !(d->submission_state == 1 && d->discarded))) return -1;
++    if (d->submission_state == 0) d->restore_record_state();
++    else { d->buffer_states.clear(); d->image_states.clear(); }
+     d->upload_staging_buffers.clear();
+     d->download_post_buffers.clear();
+     d->download_post_mats_fp16.clear();
+     d->download_post_mats.clear();
++    d->managed_buffers.clear();
++    d->managed_images.clear();
++    d->managed_hosts.clear();
+ 
+     for (size_t i = 0; i < d->image_blocks_to_destroy.size(); i++)
+     {
+@@ -2122,31 +2515,37 @@ int VkCompute::reset()
+         d->descriptorsets.clear();
+     }
+ 
++    d->release_record_payloads();
+     d->delayed_records.clear();
++    d->direct_pipeline_owners.clear();
+ 
+     d->pending_dispatch_total = 0;
+ 
+     // reset command buffer and fence
+     {
+         VkResult ret = vkResetCommandBuffer(d->compute_command_buffer, 0);
++        d->operation_result = ret;
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkResetCommandBuffer failed %d", ret);
++            d->valid = false;
+             return -1;
+         }
+     }
+     {
+         VkResult ret = vkResetFences(vkdev->vkdevice(), 1, &d->compute_command_fence);
++        d->operation_result = ret;
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkResetFences failed %d", ret);
++            d->valid = false;
+             return -1;
+         }
+     }
+ 
+     if (vkdev->info.support_VK_KHR_push_descriptor())
+     {
+-        d->begin_command_buffer();
++        if (d->begin_command_buffer() != 0) { d->valid = false; return -1; }
+ 
+ #if NCNN_BENCHMARK
+         if (d->query_pool)
+@@ -2154,6 +2553,12 @@ int VkCompute::reset()
+ #endif // NCNN_BENCHMARK
+     }
+ 
++    d->submission_state = 0;
++    d->recording_started = false;
++    d->discarded = false;
++    d->observed_submit = d->uncertain_submit = false;
++    d->submit_result = d->wait_result = VK_NOT_READY;
++    d->finalize_status = -1;
+     return 0;
+ }
+ 
+@@ -2213,6 +2618,7 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
+ 
+ void VkCompute::barrier_readwrite(const VkMat& binding)
+ {
++    d->snapshot(binding);
+     if (binding.data->access_flags & VK_ACCESS_SHADER_WRITE_BIT || binding.data->stage_flags != VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+     {
+         // barrier device any @ compute/null to shader-readwrite @ compute
+@@ -2255,6 +2661,7 @@ void VkCompute::barrier_readwrite(const VkMat& binding)
+ 
+ void VkCompute::barrier_readwrite(const VkImageMat& binding)
+ {
++    d->snapshot(binding);
+     if (binding.data->access_flags & VK_ACCESS_SHADER_WRITE_BIT || binding.data->image_layout != VK_IMAGE_LAYOUT_GENERAL || binding.data->stage_flags != VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+     {
+         // image layout transform any @ any to shader-write @ compute
+@@ -2303,6 +2710,7 @@ void VkCompute::barrier_readwrite(const VkImageMat& binding)
+ 
+ void VkCompute::barrier_readonly(const VkImageMat& binding)
+ {
++    d->snapshot(binding);
+     if (binding.data->access_flags & VK_ACCESS_SHADER_WRITE_BIT || binding.data->image_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || binding.data->stage_flags != VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+     {
+         // image layout transform any @ any to shader-readonly-optimal @ compute
+@@ -2356,6 +2764,13 @@ public:
+     ~VkTransferPrivate();
+ 
+     int init();
++    int init_status;
++    std::atomic<bool> used_for_model_or_commands;
++    bool upload_may_be_pending;
++    bool compute_may_be_pending;
++    bool device_lost_retired;
++    VkResult submit_result;
++    VkResult wait_result;
+     int begin_command_buffer();
+     int end_command_buffer();
+ 
+@@ -2380,6 +2795,11 @@ public:
+ VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev)
+     : vkdev(_vkdev)
+ {
++    used_for_model_or_commands.store(false);
++    upload_may_be_pending = false;
++    compute_may_be_pending = false;
++    device_lost_retired = false;
++    submit_result = wait_result = VK_NOT_READY;
+     pending_upload_total = 0;
+ 
+     compute_command_pool = 0;
+@@ -2393,24 +2813,23 @@ VkTransferPrivate::VkTransferPrivate(const VulkanDevice* _vkdev)
+     upload_command_fence = 0;
+     compute_command_fence = 0;
+ 
+-    init();
++    init_status = init();
+ }
+ 
+ VkTransferPrivate::~VkTransferPrivate()
+ {
+-    vkDestroyFence(vkdev->vkdevice(), compute_command_fence, 0);
+-
+-    vkFreeCommandBuffers(vkdev->vkdevice(), compute_command_pool, 1, &compute_command_buffer);
+-    vkDestroyCommandPool(vkdev->vkdevice(), compute_command_pool, 0);
++    if (compute_command_fence) vkDestroyFence(vkdev->vkdevice(), compute_command_fence, 0);
++    if (compute_command_pool && compute_command_buffer)
++        vkFreeCommandBuffers(vkdev->vkdevice(), compute_command_pool, 1, &compute_command_buffer);
++    if (compute_command_pool) vkDestroyCommandPool(vkdev->vkdevice(), compute_command_pool, 0);
+ 
+     if (!vkdev->info.unified_compute_transfer_queue())
+     {
+-        vkDestroyFence(vkdev->vkdevice(), upload_command_fence, 0);
+-
+-        vkDestroySemaphore(vkdev->vkdevice(), upload_compute_semaphore, 0);
+-
+-        vkFreeCommandBuffers(vkdev->vkdevice(), transfer_command_pool, 1, &upload_command_buffer);
+-        vkDestroyCommandPool(vkdev->vkdevice(), transfer_command_pool, 0);
++        if (upload_command_fence) vkDestroyFence(vkdev->vkdevice(), upload_command_fence, 0);
++        if (upload_compute_semaphore) vkDestroySemaphore(vkdev->vkdevice(), upload_compute_semaphore, 0);
++        if (transfer_command_pool && upload_command_buffer)
++            vkFreeCommandBuffers(vkdev->vkdevice(), transfer_command_pool, 1, &upload_command_buffer);
++        if (transfer_command_pool) vkDestroyCommandPool(vkdev->vkdevice(), transfer_command_pool, 0);
+     }
+ }
+ 
+@@ -2424,12 +2843,14 @@ int VkTransferPrivate::init()
+         commandPoolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+         commandPoolCreateInfo.queueFamilyIndex = vkdev->info.compute_queue_family_index();
+ 
+-        VkResult ret = vkCreateCommandPool(vkdev->vkdevice(), &commandPoolCreateInfo, 0, &compute_command_pool);
+-        if (ret != VK_SUCCESS)
++        VkCommandPool created = VK_NULL_HANDLE;
++        VkResult ret = vkCreateCommandPool(vkdev->vkdevice(), &commandPoolCreateInfo, 0, &created);
++        if (ret != VK_SUCCESS || !created)
+         {
+             NCNN_LOGE("vkCreateCommandPool failed %d", ret);
+             return -1;
+         }
++        compute_command_pool = created;
+     }
+ 
+     // compute_command_buffer
+@@ -2441,12 +2862,14 @@ int VkTransferPrivate::init()
+         commandBufferAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+         commandBufferAllocateInfo.commandBufferCount = 1;
+ 
+-        VkResult ret = vkAllocateCommandBuffers(vkdev->vkdevice(), &commandBufferAllocateInfo, &compute_command_buffer);
+-        if (ret != VK_SUCCESS)
++        VkCommandBuffer created = VK_NULL_HANDLE;
++        VkResult ret = vkAllocateCommandBuffers(vkdev->vkdevice(), &commandBufferAllocateInfo, &created);
++        if (ret != VK_SUCCESS || !created)
+         {
+             NCNN_LOGE("vkAllocateCommandBuffers failed %d", ret);
+             return -1;
+         }
++        compute_command_buffer = created;
+     }
+ 
+     // compute_command_fence
+@@ -2456,12 +2879,14 @@ int VkTransferPrivate::init()
+         fenceCreateInfo.pNext = 0;
+         fenceCreateInfo.flags = 0;
+ 
+-        VkResult ret = vkCreateFence(vkdev->vkdevice(), &fenceCreateInfo, 0, &compute_command_fence);
+-        if (ret != VK_SUCCESS)
++        VkFence created = VK_NULL_HANDLE;
++        VkResult ret = vkCreateFence(vkdev->vkdevice(), &fenceCreateInfo, 0, &created);
++        if (ret != VK_SUCCESS || !created)
+         {
+             NCNN_LOGE("vkCreateFence failed %d", ret);
+             return -1;
+         }
++        compute_command_fence = created;
+     }
+ 
+     if (!vkdev->info.unified_compute_transfer_queue())
+@@ -2474,12 +2899,14 @@ int VkTransferPrivate::init()
+             commandPoolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+             commandPoolCreateInfo.queueFamilyIndex = vkdev->info.transfer_queue_family_index();
+ 
+-            VkResult ret = vkCreateCommandPool(vkdev->vkdevice(), &commandPoolCreateInfo, 0, &transfer_command_pool);
+-            if (ret != VK_SUCCESS)
++            VkCommandPool created = VK_NULL_HANDLE;
++            VkResult ret = vkCreateCommandPool(vkdev->vkdevice(), &commandPoolCreateInfo, 0, &created);
++            if (ret != VK_SUCCESS || !created)
+             {
+                 NCNN_LOGE("vkCreateCommandPool failed %d", ret);
+                 return -1;
+             }
++            transfer_command_pool = created;
+         }
+ 
+         // upload_command_buffer
+@@ -2491,12 +2918,14 @@ int VkTransferPrivate::init()
+             commandBufferAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+             commandBufferAllocateInfo.commandBufferCount = 1;
+ 
+-            VkResult ret = vkAllocateCommandBuffers(vkdev->vkdevice(), &commandBufferAllocateInfo, &upload_command_buffer);
+-            if (ret != VK_SUCCESS)
++            VkCommandBuffer created = VK_NULL_HANDLE;
++            VkResult ret = vkAllocateCommandBuffers(vkdev->vkdevice(), &commandBufferAllocateInfo, &created);
++            if (ret != VK_SUCCESS || !created)
+             {
+                 NCNN_LOGE("vkAllocateCommandBuffers failed %d", ret);
+                 return -1;
+             }
++            upload_command_buffer = created;
+         }
+ 
+         // upload_compute_semaphore
+@@ -2506,12 +2935,14 @@ int VkTransferPrivate::init()
+             semaphoreCreateInfo.pNext = 0;
+             semaphoreCreateInfo.flags = 0;
+ 
+-            VkResult ret = vkCreateSemaphore(vkdev->vkdevice(), &semaphoreCreateInfo, 0, &upload_compute_semaphore);
+-            if (ret != VK_SUCCESS)
++            VkSemaphore created = VK_NULL_HANDLE;
++            VkResult ret = vkCreateSemaphore(vkdev->vkdevice(), &semaphoreCreateInfo, 0, &created);
++            if (ret != VK_SUCCESS || !created)
+             {
+                 NCNN_LOGE("vkCreateSemaphore failed %d", ret);
+                 return -1;
+             }
++            upload_compute_semaphore = created;
+         }
+ 
+         // upload_command_fence
+@@ -2521,18 +2952,18 @@ int VkTransferPrivate::init()
+             fenceCreateInfo.pNext = 0;
+             fenceCreateInfo.flags = 0;
+ 
+-            VkResult ret = vkCreateFence(vkdev->vkdevice(), &fenceCreateInfo, 0, &upload_command_fence);
+-            if (ret != VK_SUCCESS)
++            VkFence created = VK_NULL_HANDLE;
++            VkResult ret = vkCreateFence(vkdev->vkdevice(), &fenceCreateInfo, 0, &created);
++            if (ret != VK_SUCCESS || !created)
+             {
+                 NCNN_LOGE("vkCreateFence failed %d", ret);
+                 return -1;
+             }
++            upload_command_fence = created;
+         }
+     }
+ 
+-    begin_command_buffer();
+-
+-    return 0;
++    return begin_command_buffer();
+ }
+ 
+ int VkTransferPrivate::begin_command_buffer()
+@@ -2606,11 +3037,68 @@ VkTransfer::VkTransfer(const VulkanDevice* _vkdev)
+ 
+ VkTransfer::~VkTransfer()
+ {
++    if (!transfer_batches_retired()) {
++        // A real owner must retain this object and its Net/device/allocators.
++        // This defensive retention is not a replacement for that owner.
++        NCNN_LOGE("VkTransfer destroyed before retirement; private state retained");
++        return;
++    }
+     delete d;
+ }
+ 
++bool VkTransfer::is_valid() const
++{
++    return d->init_status == 0 && !d->device_lost_retired;
++}
++
++const VulkanDevice* VkTransfer::vulkan_device() const
++{
++    return vkdev;
++}
++
++bool VkTransfer::claim_fresh_for_model_load()
++{
++    return is_valid() && !d->used_for_model_or_commands.exchange(true);
++}
++
++bool VkTransfer::transfer_batches_retired() const
++{
++    return !d->upload_may_be_pending && !d->compute_may_be_pending;
++}
++
++int VkTransfer::wait_transfer_retirement(uint64_t timeout_ns)
++{
++    if (timeout_ns == UINT64_MAX) return -1;
++    VkFence pending[2];
++    uint32_t count = 0;
++    if (d->upload_may_be_pending) pending[count++] = d->upload_command_fence;
++    if (d->compute_may_be_pending) pending[count++] = d->compute_command_fence;
++    if (!count) return 0;
++    VkResult ret = vkWaitForFences(vkdev->vkdevice(), count, pending, VK_TRUE, timeout_ns);
++    d->wait_result = ret;
++    if (ret == VK_TIMEOUT || ret == VK_NOT_READY) return 1;
++    if (ret != VK_SUCCESS) return -1;
++    d->upload_may_be_pending = false;
++    d->compute_may_be_pending = false;
++    return 0;
++}
++VkResult VkTransfer::last_submit_result() const { return d->submit_result; }
++VkResult VkTransfer::last_wait_result() const { return d->wait_result; }
++int VkTransfer::retire_device_lost()
++{
++    // No wait or state inference occurs here. The coordinator has already
++    // established quiescence for every queue on this exact logical device.
++    d->device_lost_retired = true;
++    d->init_status = -1;
++    d->upload_may_be_pending = false;
++    d->compute_may_be_pending = false;
++    return 0;
++}
++
+ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bool flatten)
+ {
++    d->used_for_model_or_commands.store(true);
++    if (!is_valid() || !transfer_batches_retired()) return;
+     //     NCNN_LOGE("record_upload src = %d | %d %d %d @ %d", src.dims, src.w, src.h, src.c, src.elempack);
+ 
+     // NOTE keep the hack here ?
+@@ -2811,11 +3299,18 @@ void VkTransfer::record_upload(const Mat& src, VkMat& dst, const Option& opt, bo
+ 
+ int VkTransfer::submit_and_wait()
+ {
++    return submit_and_wait(UINT64_MAX);
++}
++
++int VkTransfer::submit_and_wait(uint64_t timeout_ns)
++{
++    d->used_for_model_or_commands.store(true);
++    if (!is_valid() || !transfer_batches_retired()) return -1;
+     //     NCNN_LOGE("submit_and_wait");
+ 
+     // end command buffer
+     {
+-        d->end_command_buffer();
++        if (d->end_command_buffer() != 0) { d->init_status = -1; return -1; }
+     }
+ 
+     VkQueue compute_queue = vkdev->acquire_queue(vkdev->info.compute_queue_family_index());
+@@ -2840,9 +3335,14 @@ int VkTransfer::submit_and_wait()
+             submitInfo.signalSemaphoreCount = 0;
+             submitInfo.pSignalSemaphores = 0;
+ 
++            d->compute_may_be_pending = true;
+             VkResult ret = vkQueueSubmit(compute_queue, 1, &submitInfo, d->compute_command_fence);
++            d->submit_result = ret;
+             if (ret != VK_SUCCESS)
+             {
++                if (ret == VK_ERROR_OUT_OF_HOST_MEMORY || ret == VK_ERROR_OUT_OF_DEVICE_MEMORY)
++                    d->compute_may_be_pending = false;
++                d->init_status = -1;
+                 NCNN_LOGE("vkQueueSubmit failed %d", ret);
+                 vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+                 return -1;
+@@ -2872,9 +3372,14 @@ int VkTransfer::submit_and_wait()
+             submitInfo.signalSemaphoreCount = 1;
+             submitInfo.pSignalSemaphores = &d->upload_compute_semaphore;
+ 
++            d->upload_may_be_pending = true;
+             VkResult ret = vkQueueSubmit(transfer_queue, 1, &submitInfo, d->upload_command_fence);
++            d->submit_result = ret;
+             if (ret != VK_SUCCESS)
+             {
++                if (ret == VK_ERROR_OUT_OF_HOST_MEMORY || ret == VK_ERROR_OUT_OF_DEVICE_MEMORY)
++                    d->upload_may_be_pending = false;
++                d->init_status = -1;
+                 NCNN_LOGE("vkQueueSubmit failed %d", ret);
+                 vkdev->reclaim_queue(vkdev->info.transfer_queue_family_index(), transfer_queue);
+                 vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+@@ -2895,12 +3400,30 @@ int VkTransfer::submit_and_wait()
+             submitInfo.signalSemaphoreCount = 0;
+             submitInfo.pSignalSemaphores = 0;
+ 
++            d->compute_may_be_pending = true;
+             VkResult ret = vkQueueSubmit(compute_queue, 1, &submitInfo, d->compute_command_fence);
++            d->submit_result = ret;
+             if (ret != VK_SUCCESS)
+             {
++                if (ret == VK_ERROR_OUT_OF_HOST_MEMORY || ret == VK_ERROR_OUT_OF_DEVICE_MEMORY)
++                    d->compute_may_be_pending = false;
+                 NCNN_LOGE("vkQueueSubmit failed %d", ret);
+                 vkdev->reclaim_queue(vkdev->info.transfer_queue_family_index(), transfer_queue);
+                 vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
++                // A prior upload batch was accepted. OOM guarantees this
++                // second submit did not alter the referenced resources, but
++                // does not retire the already accepted upload. Attempt its
++                // fence wait; a wait failure remains an unresolved lifetime
++                // error; the external owner must keep every referenced object alive.
++                d->init_status = -1;
++                if (ret == VK_ERROR_OUT_OF_HOST_MEMORY || ret == VK_ERROR_OUT_OF_DEVICE_MEMORY)
++                {
++                    VkResult upload_ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->upload_command_fence, VK_TRUE, timeout_ns);
++                    d->wait_result = upload_ret;
++                    if (upload_ret == VK_SUCCESS) d->upload_may_be_pending = false;
++                    if (upload_ret != VK_SUCCESS)
++                        NCNN_LOGE("prior upload fence wait failed %d", upload_ret);
++                }
+                 return -1;
+             }
+         }
+@@ -2913,23 +3436,30 @@ int VkTransfer::submit_and_wait()
+     // wait
+     if (vkdev->info.unified_compute_transfer_queue())
+     {
+-        VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence, VK_TRUE, (uint64_t)-1);
++        VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence, VK_TRUE, timeout_ns);
++        d->wait_result = ret;
+         if (ret != VK_SUCCESS)
+         {
++            d->init_status = -1;
+             NCNN_LOGE("vkWaitForFences failed %d", ret);
+             return -1;
+         }
++        d->compute_may_be_pending = false;
+     }
+     else
+     {
+         VkFence fences[2] = {d->upload_command_fence, d->compute_command_fence};
+ 
+-        VkResult ret = vkWaitForFences(vkdev->vkdevice(), 2, fences, VK_TRUE, (uint64_t)-1);
++        VkResult ret = vkWaitForFences(vkdev->vkdevice(), 2, fences, VK_TRUE, timeout_ns);
++        d->wait_result = ret;
+         if (ret != VK_SUCCESS)
+         {
++            d->init_status = -1;
+             NCNN_LOGE("vkWaitForFences failed %d", ret);
+             return -1;
+         }
++        d->upload_may_be_pending = false;
++        d->compute_may_be_pending = false;
+     }
+ 
+     d->pending_upload_total = 0;
+@@ -2939,6 +3469,8 @@ int VkTransfer::submit_and_wait()
+ 
+ int VkTransfer::reset()
+ {
++    d->used_for_model_or_commands.store(true);
++    if (!is_valid() || !transfer_batches_retired()) return -1;
+     d->upload_staging_buffers.clear();
+ 
+     d->pending_upload_total = 0;
+@@ -2949,6 +3481,7 @@ int VkTransfer::reset()
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkResetCommandBuffer failed %d", ret);
++            d->init_status = -1;
+             return -1;
+         }
+     }
+@@ -2957,6 +3490,7 @@ int VkTransfer::reset()
+         if (ret != VK_SUCCESS)
+         {
+             NCNN_LOGE("vkResetFences failed %d", ret);
++            d->init_status = -1;
+             return -1;
+         }
+     }
+@@ -2968,6 +3502,7 @@ int VkTransfer::reset()
+             if (ret != VK_SUCCESS)
+             {
+                 NCNN_LOGE("vkResetCommandBuffer failed %d", ret);
++                d->init_status = -1;
+                 return -1;
+             }
+         }
+@@ -2976,12 +3511,13 @@ int VkTransfer::reset()
+             if (ret != VK_SUCCESS)
+             {
+                 NCNN_LOGE("vkResetFences failed %d", ret);
++                d->init_status = -1;
+                 return -1;
+             }
+         }
+     }
+ 
+-    d->begin_command_buffer();
++    if (d->begin_command_buffer() != 0) { d->init_status = -1; return -1; }
+ 
+     return 0;
+ }
+diff --git a/src/command.h b/src/command.h
+index a6738238..d71a3947 100644
+--- a/src/command.h
++++ b/src/command.h
+@@ -9,6 +9,7 @@
+ #if NCNN_VULKAN
+ 
+ #include "mat.h"
++#include <chrono>
+ 
+ namespace ncnn {
+ 
+@@ -19,6 +20,27 @@ class ImportAndroidHardwareBufferPipeline;
+ #endif // __ANDROID_API__ >= 26
+ #endif // NCNN_PLATFORM_API
+ class VkComputePrivate;
++// Optional observation only. No query allocation or GPU commands until enabled.
++class NCNN_EXPORT VkBatchTimestamp
++{
++public:
++    explicit VkBatchTimestamp(const VulkanDevice* device);
++    ~VkBatchTimestamp();
++    int configure(bool enabled);
++    void begin(VkCommandBuffer command);
++    void end(VkCommandBuffer command);
++    void submitted();
++    void retired();
++    void result(uint64_t* ns, uint32_t* observed, uint32_t* valid_bits, uint32_t* period_bits) const;
++private:
++    const VulkanDevice* device;
++    VkQueryPool pool;
++    uint32_t bits, period_bits;
++    float period;
++    uint64_t elapsed;
++    bool observed;
++    std::chrono::steady_clock::time_point submit_wall;
++};
+ class NCNN_EXPORT VkCompute
+ {
+ public:
+@@ -64,6 +86,45 @@ public:
+ #endif // __ANDROID_API__ >= 26
+ #endif // NCNN_PLATFORM_API
+ 
++    // Meguviz exact-source lifecycle extension. No reset before retirement.
++    bool is_valid() const;
++    // Caller-owned command mode. Configure before recording/first submit.
++    // This does not retain the device/Net/Pipeline/allocator or external Mat
++    // data; a real lifecycle owner must keep those objects alive as well.
++    int set_retirement_managed(uint64_t wait_ns);
++    bool compute_batches_retired() const;
++    // 0 recording, 1 sealed, 2 observed pending, 3 retired, 4 finalized,
++    // 5 submit result uncertain: the command/fence may still be in use.
++    int execution_state() const;
++    bool submission_uncertain() const;
++    VkResult last_submit_result() const;
++    VkResult last_wait_result() const;
++    VkResult last_operation_result() const;
++    // 0: physical retirement known, 1: timeout/pending, -1: error, still retained.
++    // Does not apply delayed host records; host_finalize follows retirement.
++    int wait_compute_retirement(uint64_t timeout_ns);
++    // Failure retirement only. Caller must have synchronized every queue and
++    // proved this logical device quiescent (vkDeviceWaitIdle SUCCESS or
++    // DEVICE_LOST after a real device-loss observation). No host post record is
++    // applied, no successful GPU observation is fabricated, reset is disabled.
++    // Last submit/wait getters keep the actual Vulkan results, unchanged.
++    int retire_device_lost();
++    // Managed state 0/1 only: discard a never-submitted tail and restore its
++    // optimistic buffer/image CPU metadata. Never rolls back pending batches.
++    // Does not reset the command; no more recording/submission until reset.
++    int discard_unsubmitted();
++    int seal();
++    int submit_async(uint32_t wait_count = 0, const VkSemaphore* waits = 0,
++                     const VkPipelineStageFlags* stages = 0,
++                     uint32_t signal_count = 0, const VkSemaphore* signals = 0);
++    int poll(); // 0 retired, 1 pending, -1 failure
++    int wait(uint64_t timeout_ns); // timeout preserves pending resources
++    int host_finalize(); // idempotent, after physical retirement
++    void set_submit_observer(void (*observer)(void*, uint64_t, uint32_t), void* context);
++    uint64_t submitted_batch_count() const;
++    uint64_t finalized_batch_count() const;
++    int enable_gpu_timestamps(bool enabled);
++    void set_gpu_timestamp_observer(void (*observer)(void*, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t), void* context);
+     int submit_and_wait();
+ 
+     int reset();
+@@ -84,6 +145,9 @@ protected:
+     void barrier_readonly(const VkImageMat& binding);
+ 
+ private:
++    bool recording_allowed() const;
++    VkCompute(const VkCompute&) = delete;
++    VkCompute& operator=(const VkCompute&) = delete;
+     VkComputePrivate* const d;
+ };
+ 
+@@ -94,10 +158,27 @@ public:
+     explicit VkTransfer(const VulkanDevice* vkdev);
+     virtual ~VkTransfer();
+ 
++    // Internal pre-submit initialization status; not a retirement signal.
++    bool is_valid() const;
++    const VulkanDevice* vulkan_device() const;
++    // Single-owner private SDK use only. The caller must serialize all access.
++    bool claim_fresh_for_model_load();
++    // Exact-source SDK: only this transfer object's command fences are covered.
++    // Caller serializes access and holds Net, transfer, device and model data.
++    bool transfer_batches_retired() const;
++    int wait_transfer_retirement(uint64_t timeout_ns);
++    VkResult last_submit_result() const;
++    VkResult last_wait_result() const;
++    // Same quiescence precondition as VkCompute::retire_device_lost. This marks
++    // physical failure retirement, never successful model upload or valid data.
++    int retire_device_lost();
++
+ public:
+     void record_upload(const Mat& src, VkMat& dst, const Option& opt, bool flatten = true);
+ 
+     int submit_and_wait();
++    // Private owner entry. Timeout applies to this batch, including OOM recovery.
++    int submit_and_wait(uint64_t timeout_ns);
+ 
+     int reset();
+ 
+@@ -107,6 +188,8 @@ protected:
+     const VulkanDevice* vkdev;
+ 
+ private:
++    VkTransfer(const VkTransfer&) = delete;
++    VkTransfer& operator=(const VkTransfer&) = delete;
+     VkTransferPrivate* const d;
+ };
+ 
+diff --git a/src/gpu.cpp b/src/gpu.cpp
+index 7d8ce33d..55103c27 100644
+--- a/src/gpu.cpp
++++ b/src/gpu.cpp
+@@ -8,6 +8,7 @@
+ #include <ctype.h>
+ #include <float.h>
+ #include <limits.h>
++#include <new>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -3134,6 +3135,12 @@ int create_gpu_instance(const char* driver_path)
+ 
+     if (support_VK_KHR_external_memory_capabilities)
+         enabledExtensions.push_back("VK_KHR_external_memory_capabilities");
++    if (instance_support_VK_VERSION_1_1 || support_VK_KHR_get_physical_device_properties2)
++    {
++        for (uint32_t j = 0; j < instanceExtensionPropertyCount; ++j)
++            if (strcmp(instanceExtensionProperties[j].extensionName, "VK_KHR_external_semaphore_capabilities") == 0)
++                enabledExtensions.push_back("VK_KHR_external_semaphore_capabilities");
++    }
+     if (support_VK_KHR_device_group_creation)
+         enabledExtensions.push_back("VK_KHR_device_group_creation");
+     if (support_VK_KHR_get_physical_device_properties2)
+@@ -3742,6 +3749,10 @@ public:
+     void destroy_utility_operator();
+ 
+     VkDevice device;
++    uint32_t enabled_api_version;
++    VkPhysicalDeviceFeatures enabled_core_features;
++    const void* enabled_feature_chain;
++    std::vector<const char*> enabled_extension_names;
+ 
+     // hardware queue
+     mutable std::vector<VkQueue> compute_queues;
+@@ -3793,11 +3804,18 @@ public:
+ 
+     // device is valid and sucessfully initialized
+     bool valid;
++    VkCompute* initialization_command;
++    VkResult initialization_result;
++    bool dummy_ready;
++    bool initialization_lost;
+ };
+ 
+ VulkanDevicePrivate::VulkanDevicePrivate(VulkanDevice* _vkdev)
+     : vkdev(_vkdev)
+ {
++    enabled_api_version = 0;
++    memset(&enabled_core_features, 0, sizeof(enabled_core_features));
++    enabled_feature_chain = 0;
+     device = 0;
+     texelfetch_sampler = 0;
+     dummy_allocator = 0;
+@@ -3806,6 +3824,10 @@ VulkanDevicePrivate::VulkanDevicePrivate(VulkanDevice* _vkdev)
+     shader_coverage = 0;
+ #endif
+     valid = false;
++    initialization_command = 0;
++    initialization_result = VK_NOT_READY;
++    dummy_ready = false;
++    initialization_lost = false;
+     memset(uop_packing, 0, sizeof(uop_packing));
+     memset(uop_packing_int8, 0, sizeof(uop_packing_int8));
+     memset(uop_packing_bf16, 0, sizeof(uop_packing_bf16));
+@@ -3813,6 +3835,8 @@ VulkanDevicePrivate::VulkanDevicePrivate(VulkanDevice* _vkdev)
+ 
+ int VulkanDevicePrivate::create_dummy_buffer_image()
+ {
++    try
++    {
+     dummy_allocator = new VkDummyAllocator(vkdev);
+ 
+     dummy_buffer.create(1, 4u, dummy_allocator);
+@@ -3827,21 +3851,73 @@ int VulkanDevicePrivate::create_dummy_buffer_image()
+ #endif
+     }
+ 
+-    VkDummyCompute cmd(vkdev);
++    bool expects_readonly = vkdev->info.support_image_storage();
++#if __APPLE__
++    expects_readonly = expects_readonly && vkdev->info.type() == 0;
++#endif
++    if (dummy_buffer.empty() || (vkdev->info.support_image_storage() && dummy_image.empty()) ||
++        (expects_readonly && dummy_image_readonly.empty()))
++    {
++        initialization_result = VK_ERROR_INITIALIZATION_FAILED;
++        return -1;
++    }
++    VkDummyCompute* cmd = new VkDummyCompute(vkdev);
++    initialization_command = cmd;
++    if (!cmd->is_valid())
++    {
++        initialization_result = cmd->last_operation_result();
++        initialization_lost = initialization_result == VK_ERROR_DEVICE_LOST;
++        delete initialization_command; initialization_command = 0;
++        return -1;
++    }
++    if (cmd->set_retirement_managed(100000000) != 0)
++    {
++        initialization_result = VK_ERROR_INITIALIZATION_FAILED;
++        delete initialization_command; initialization_command = 0;
++        return -1;
++    }
+ 
+-    cmd.record_dummy(dummy_buffer);
++    cmd->record_dummy(dummy_buffer);
+     if (vkdev->info.support_image_storage())
+     {
+-        cmd.record_dummy(dummy_image);
++        cmd->record_dummy(dummy_image);
+ #if __APPLE__
+         if (vkdev->info.type() == 0)
+-            cmd.record_dummy_readonly(dummy_image_readonly);
++            cmd->record_dummy_readonly(dummy_image_readonly);
+ #else
+-        cmd.record_dummy_readonly(dummy_image_readonly);
++        cmd->record_dummy_readonly(dummy_image_readonly);
+ #endif
+     }
+ 
+-    return cmd.submit_and_wait();
++    const auto submitted = cmd->submit_async();
++    initialization_result = cmd->last_submit_result();
++    initialization_lost = initialization_result == VK_ERROR_DEVICE_LOST;
++    if (submitted != 0)
++    {
++        if (cmd->compute_batches_retired())
++        {
++            cmd->discard_unsubmitted();
++            delete initialization_command; initialization_command = 0;
++        }
++        return -1;
++    }
++    return vkdev->poll_initialization(100000000);
++    }
++    catch (const std::bad_alloc&)
++    {
++        initialization_result = VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++    catch (...)
++    {
++        initialization_result = VK_ERROR_INITIALIZATION_FAILED;
++    }
++    // Installed before the first possible submit, including exceptional paths.
++    if (initialization_command && initialization_command->compute_batches_retired())
++    {
++        initialization_command->discard_unsubmitted();
++        delete initialization_command; initialization_command = 0;
++    }
++    return -1;
+ }
+ 
+ void VulkanDevicePrivate::destroy_dummy_buffer_image()
+@@ -4068,9 +4144,42 @@ void VulkanDevicePrivate::destroy_utility_operator()
+ VulkanDevice::VulkanDevice(int device_index)
+     : info(get_gpu_info(device_index)), d(new VulkanDevicePrivate(this))
+ {
++    try
++    {
+     try_create_gpu_instance();
+ 
+     std::vector<const char*> enabledExtensions;
++    bool meguviz_external_base = false;
++    bool meguviz_external_fd = false;
++    uint32_t meguviz_extension_count = 0;
++    vkEnumerateDeviceExtensionProperties(info.physical_device(), 0, &meguviz_extension_count, 0);
++    std::vector<VkExtensionProperties> meguviz_extensions(meguviz_extension_count);
++    vkEnumerateDeviceExtensionProperties(info.physical_device(), 0, &meguviz_extension_count, meguviz_extensions.data());
++    for (uint32_t i = 0; i < meguviz_extension_count; ++i)
++    {
++        if (strcmp(meguviz_extensions[i].extensionName, "VK_KHR_external_semaphore") == 0) meguviz_external_base = true;
++        if (strcmp(meguviz_extensions[i].extensionName, "VK_KHR_external_semaphore_fd") == 0) meguviz_external_fd = true;
++    }
++    meguviz_sync_fd_enabled = false;
++    auto meguviz_query = (PFN_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR)vkGetInstanceProcAddr(get_gpu_instance(), "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR");
++    if (meguviz_query && (meguviz_external_base || info.api_version() >= VK_MAKE_VERSION(1, 1, 0)) && meguviz_external_fd)
++    {
++        VkPhysicalDeviceExternalSemaphoreInfoKHR query = {};
++        query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO_KHR;
++        query.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
++        VkExternalSemaphorePropertiesKHR properties = {};
++        properties.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES_KHR;
++        meguviz_query(info.physical_device(), &query, &properties);
++        const VkExternalSemaphoreFeatureFlags features = VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT;
++        meguviz_sync_fd_enabled = (properties.externalSemaphoreFeatures & features) == features;
++        if (meguviz_sync_fd_enabled)
++        {
++            if (meguviz_external_base) enabledExtensions.push_back("VK_KHR_external_semaphore");
++            enabledExtensions.push_back("VK_KHR_external_semaphore_fd");
++        }
++    }
++    vkImportSemaphoreFdKHR = 0;
++    vkGetSemaphoreFdKHR = 0;
+     if (info.support_VK_KHR_8bit_storage())
+         enabledExtensions.push_back("VK_KHR_8bit_storage");
+     if (info.support_VK_KHR_16bit_storage())
+@@ -4220,15 +4329,25 @@ VulkanDevice::VulkanDevice(int device_index)
+     deviceCreateInfo.ppEnabledExtensionNames = enabledExtensions.data();
+     deviceCreateInfo.pEnabledFeatures = &info.physicalDevicefeatures();
+ 
+-    VkResult ret = vkCreateDevice(info.physicalDevice(), &deviceCreateInfo, 0, &d->device);
++    VkDevice created_device = VK_NULL_HANDLE;
++    VkResult ret = vkCreateDevice(info.physicalDevice(), &deviceCreateInfo, 0, &created_device);
++    d->initialization_result = ret;
++    d->initialization_lost = ret == VK_ERROR_DEVICE_LOST;
+     if (ret != VK_SUCCESS)
+     {
+         NCNN_LOGE("vkCreateDevice failed %d", ret);
+         return;
+     }
++    // The output parameter is not an owned object on a failed create call.
++    d->device = created_device;
+ 
+     init_device_extension();
+ 
++    d->enabled_api_version = std::min(g_instance.instance_api_version, info.api_version());
++    d->enabled_core_features = *deviceCreateInfo.pEnabledFeatures;
++    d->enabled_feature_chain = deviceCreateInfo.pNext;
++    d->enabled_extension_names = enabledExtensions;
++
+ #if NCNN_COVERAGE
+     d->shader_coverage = create_shader_coverage(this);
+     if (!d->shader_coverage)
+@@ -4298,13 +4417,35 @@ VulkanDevice::VulkanDevice(int device_index)
+         return;
+     }
+ 
+-    d->pipeline_cache = new PipelineCache(this);
+-
+-    d->valid = true;
++    if (!d->valid) poll_initialization(0);
++    }
++    catch (const std::bad_alloc&)
++    {
++        d->valid = false;
++        if (!d->initialization_lost) d->initialization_result = VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++    catch (...)
++    {
++        d->valid = false;
++        if (!d->initialization_lost) d->initialization_result = VK_ERROR_INITIALIZATION_FAILED;
++    }
+ }
+ 
+ VulkanDevice::~VulkanDevice()
+ {
++    if (d->initialization_command)
++    {
++        if (d->initialization_command->compute_batches_retired())
++        {
++            delete d->initialization_command;
++            d->initialization_command = 0;
++        }
++        else
++        {
++            NCNN_LOGE("VulkanDevice destroyed before initialization retirement; state retained");
++            return;
++        }
++    }
+ #if NCNN_COVERAGE
+     if (d->device)
+         vkDeviceWaitIdle(d->device);
+@@ -4364,6 +4505,77 @@ bool VulkanDevice::is_valid() const
+ {
+     return d->valid;
+ }
++VkResult VulkanDevice::initialization_result() const { return d->initialization_result; }
++bool VulkanDevice::initialization_pending() const
++{ return d->initialization_command && !d->initialization_command->compute_batches_retired(); }
++int VulkanDevice::poll_initialization(uint64_t timeout_ns) const
++{
++    if (timeout_ns > 100000000) return -1;
++    if (d->valid) return 0;
++    if (!d->device || d->initialization_lost) return -1;
++    try
++    {
++        if (d->initialization_command)
++        {
++            VkCompute* cmd = d->initialization_command;
++            const int waited = cmd->wait_compute_retirement(timeout_ns);
++            if (waited != 0)
++            {
++                d->initialization_result = cmd->last_wait_result();
++                if (d->initialization_result == VK_ERROR_DEVICE_LOST) d->initialization_lost = true;
++                return waited;
++            }
++            if (cmd->host_finalize() != 0)
++            {
++                d->initialization_result = cmd->last_submit_result() != VK_SUCCESS ?
++                    cmd->last_submit_result() : VK_ERROR_INITIALIZATION_FAILED;
++                delete d->initialization_command; d->initialization_command = 0;
++                return -1;
++            }
++            delete d->initialization_command; d->initialization_command = 0;
++            d->dummy_ready = true;
++        }
++        if (!d->dummy_ready) return -1;
++        if (!d->pipeline_cache) d->pipeline_cache = new PipelineCache(this);
++        d->valid = true;
++        d->initialization_result = VK_SUCCESS;
++        return 0;
++    }
++    catch (const std::bad_alloc&)
++    {
++        d->initialization_result = VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++    catch (...)
++    {
++        d->initialization_result = VK_ERROR_INITIALIZATION_FAILED;
++    }
++    return -1;
++}
++int VulkanDevice::retire_initialization_device_lost() const
++{
++    // An all-queues proof is supplied by the device coordinator. Do not promote
++    // this candidate to valid or replay its initialization command afterward.
++    d->valid = false;
++    d->initialization_lost = true;
++    d->initialization_result = VK_ERROR_DEVICE_LOST;
++    if (d->initialization_command)
++    {
++        d->initialization_command->retire_device_lost();
++        delete d->initialization_command;
++        d->initialization_command = 0;
++    }
++    return 0;
++}
++uint32_t VulkanDevice::enabled_api_version() const { return d->enabled_api_version; }
++const VkPhysicalDeviceFeatures& VulkanDevice::enabled_features() const { return d->enabled_core_features; }
++const void* VulkanDevice::enabled_extension_features() const { return d->enabled_feature_chain; }
++bool VulkanDevice::extension_enabled(const char* name) const
++{
++    if (!name) return false;
++    for (size_t i = 0; i < d->enabled_extension_names.size(); ++i)
++        if (strcmp(name, d->enabled_extension_names[i]) == 0) return true;
++    return false;
++}
+ 
+ VkShaderModule VulkanDevice::compile_shader_module(const uint32_t* spv_data, size_t spv_data_size) const
+ {
+@@ -4388,6 +4600,27 @@ VkShaderModule VulkanDevice::compile_shader_module(const uint32_t* spv_data, siz
+     return shader_module;
+ }
+ 
++// Bounds preflight for the operands consumed by the local-size transformer.
++// This is not a full SPIR-V semantic or security validator.
++static bool local_size_transform_operands_valid(const uint32_t* code, size_t size)
++{
++    if (!code || size < 5 * sizeof(uint32_t) || size % sizeof(uint32_t) || code[0] != 0x07230203 ||
++        !code[3] || code[3] > 0x003fffffu - 4) return false;
++    const size_t n=size/sizeof(uint32_t);unsigned local_modes=0;
++    for (size_t i=5;i<n;)
++    {
++        const uint32_t count=code[i]>>16,op=code[i]&65535u;
++        if (!count || count > n-i) return false;
++        if ((op==21 && count!=4) || (op==50 && count<4) || (op==51 && count<3)) return false;
++        if ((op==16 || op==331) && (count<3 || (((op==16 && code[i+2]==17) || (op==331 && code[i+2]==38)) && count!=6))) return false;
++        if ((op==16 && count==6 && code[i+2]==17) || (op==331 && count==6 && code[i+2]==38))
++            if (++local_modes>1) return false;
++        if (op==71 && (count<3 || ((code[i+2]==1 || code[i+2]==11) && count!=4))) return false;
++        i+=count;
++    }
++    return true;
++}
++
+ static void inject_local_size_xyz(const uint32_t* code, size_t size, uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z, uint32_t* dstcode, size_t* dstsize)
+ {
+     uint32_t local_size_x_id = -1;
+@@ -4466,31 +4699,22 @@ static void inject_local_size_xyz(const uint32_t* code, size_t size, uint32_t lo
+         else if (op == 50) // OpSpecConstant
+         {
+             uint32_t id = p[2];
+-            if (use_local_size_id)
++            // Keep local-size axis IDs alive as literal constants. Removing
++            // them breaks valid shaders that also read the local dimensions.
++            bool local_size_constant = false;
++            for (size_t i = 0; i < local_size_ids.size(); i++)
+             {
+-                // replace reserved local size constants also used by gl_WorkGroupSize
+-                bool local_size_constant = false;
+-                for (size_t i = 0; i < local_size_ids.size(); i++)
+-                {
+-                    if (id != local_size_ids[i].first)
+-                        continue;
+-
+-                    memcpy(dp, p, wordcount * sizeof(uint32_t));
+-                    dp[0] = (wordcount << 16) | 43; // OpConstant
+-                    dp[3] = local_size_ids[i].second;
+-                    local_size_constant = true;
+-                    break;
+-                }
+-                if (local_size_constant)
+-                {
+-                    p += wordcount;
+-                    dp += wordcount;
+-                    continue;
+-                }
++                if (id != local_size_ids[i].first) continue;
++                memcpy(dp, p, wordcount * sizeof(uint32_t));
++                dp[0] = (wordcount << 16) | 43; // OpConstant
++                dp[3] = local_size_ids[i].second;
++                local_size_constant = true;
++                break;
+             }
+-            else if (id == local_size_x_id || id == local_size_y_id || id == local_size_z_id)
++            if (local_size_constant)
+             {
+                 p += wordcount;
++                dp += wordcount;
+                 continue;
+             }
+         }
+@@ -4501,7 +4725,10 @@ static void inject_local_size_xyz(const uint32_t* code, size_t size, uint32_t lo
+             {
+                 if (wordcount == 6 && (p[3] == local_size_x_id || p[4] == local_size_y_id || p[5] == local_size_z_id))
+                 {
++                    memcpy(dp, p, wordcount * sizeof(uint32_t));
++                    dp[0] = (wordcount << 16) | 44; // OpConstantComposite
+                     p += wordcount;
++                    dp += wordcount;
+                     continue;
+                 }
+             }
+@@ -4541,8 +4768,7 @@ static void inject_local_size_xyz(const uint32_t* code, size_t size, uint32_t lo
+                 if (specid == 235) local_size_z_id = id;
+                 if (specid == 233 || specid == 234 || specid == 235)
+                 {
+-                    if (use_local_size_id)
+-                        local_size_ids.push_back(std::make_pair(id, local_size_xyz[specid - 233]));
++                    local_size_ids.push_back(std::make_pair(id, local_size_xyz[specid - 233]));
+                     p += wordcount;
+                     continue;
+                 }
+@@ -4553,8 +4779,6 @@ static void inject_local_size_xyz(const uint32_t* code, size_t size, uint32_t lo
+                 if (builtin == 25) // WorkgroupSize
+                 {
+                     gl_WorkGroupSize_id = id;
+-                    p += wordcount;
+-                    continue;
+                 }
+             }
+         }
+@@ -4569,8 +4793,11 @@ static void inject_local_size_xyz(const uint32_t* code, size_t size, uint32_t lo
+ 
+ VkShaderModule VulkanDevice::compile_shader_module(const uint32_t* spv_data, size_t spv_data_size, uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z) const
+ {
++    if (!local_size_transform_operands_valid(spv_data, spv_data_size)) return 0;
+     // reserve space for a uint type, three local size spec constants and their decorations
++    if (spv_data_size > (size_t)-1 - 28 * sizeof(uint32_t)) return 0;
+     uint32_t* spv_data_modified = (uint32_t*)malloc(spv_data_size + 28 * sizeof(uint32_t));
++    if (!spv_data_modified) return 0;
+     size_t spv_data_size_modified = spv_data_size;
+     inject_local_size_xyz(spv_data, spv_data_size, local_size_x, local_size_y, local_size_z, spv_data_modified, &spv_data_size_modified);
+ 
+@@ -4706,22 +4933,41 @@ int VulkanDevice::create_pipeline(VkShaderModule shader_module, VkPipelineLayout
+ }
+ 
+ int VulkanDevice::create_pipeline(VkShaderModule shader_module, VkPipelineLayout pipeline_layout, const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size, VkPipelineCache pipeline_cache, VkPipeline* pipeline) const
++{
++    return create_pipeline(shader_module, pipeline_layout, specializations, subgroup_size, pipeline_cache, 0, pipeline);
++}
++
++int VulkanDevice::create_pipeline(VkShaderModule shader_module, VkPipelineLayout pipeline_layout, const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size, VkPipelineCache pipeline_cache, const uint32_t* local_size_xyz, VkPipeline* pipeline) const
+ {
+     const int specialization_count = specializations.size();
++    if (local_size_xyz && (specializations.size() > 233 || !local_size_xyz[0] || !local_size_xyz[1] || !local_size_xyz[2])) return -1;
+ 
+-    std::vector<VkSpecializationMapEntry> specializationMapEntries(specialization_count);
++    std::vector<vk_specialization_type> specializationValues = specializations;
++    std::vector<VkSpecializationMapEntry> specializationMapEntries(specialization_count + (local_size_xyz ? 3 : 0));
+     for (int i = 0; i < specialization_count; i++)
+     {
+         specializationMapEntries[i].constantID = i;
+         specializationMapEntries[i].offset = i * sizeof(vk_specialization_type);
+         specializationMapEntries[i].size = sizeof(vk_specialization_type);
+     }
++    if (local_size_xyz)
++    {
++        for (uint32_t i = 0; i < 3; i++)
++        {
++            vk_specialization_type value; value.u32 = local_size_xyz[i];
++            specializationValues.push_back(value);
++            VkSpecializationMapEntry& entry = specializationMapEntries[specialization_count + i];
++            entry.constantID = 233 + i;
++            entry.offset = (specialization_count + i) * sizeof(vk_specialization_type);
++            entry.size = sizeof(vk_specialization_type);
++        }
++    }
+ 
+     VkSpecializationInfo specializationInfo;
+     specializationInfo.mapEntryCount = specializationMapEntries.size();
+     specializationInfo.pMapEntries = specializationMapEntries.data();
+-    specializationInfo.dataSize = specializations.size() * sizeof(vk_specialization_type);
+-    specializationInfo.pData = specializations.data();
++    specializationInfo.dataSize = specializationValues.size() * sizeof(vk_specialization_type);
++    specializationInfo.pData = specializationValues.data();
+ 
+     VkPipelineShaderStageCreateInfo pipelineShaderStageCreateInfo;
+     pipelineShaderStageCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+@@ -5281,6 +5527,11 @@ void VulkanDevice::convert_packing(const VkMat& src, VkMat& dst, int dst_elempac
+ 
+ int VulkanDevice::init_device_extension()
+ {
++    if (meguviz_sync_fd_enabled)
++    {
++        vkImportSemaphoreFdKHR = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(d->device, "vkImportSemaphoreFdKHR");
++        vkGetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(d->device, "vkGetSemaphoreFdKHR");
++    }
+     if (info.support_VK_KHR_bind_memory2())
+     {
+         vkBindBufferMemory2KHR = (PFN_vkBindBufferMemory2KHR)vkGetDeviceProcAddr(d->device, "vkBindBufferMemory2KHR");
+@@ -5384,6 +5635,18 @@ VulkanDevice* get_gpu_device(int device_index)
+     return g_default_vkdev[device_index];
+ }
+ 
++const VulkanDevice* detach_gpu_device(int device_index, const VulkanDevice* expected)
++{
++    if (!expected || device_index < 0 || device_index >= NCNN_MAX_GPU_COUNT)
++        return 0;
++    MutexLockGuard lock(g_default_vkdev_lock);
++    if (g_default_vkdev[device_index] != expected)
++        return 0;
++    VulkanDevice* detached = g_default_vkdev[device_index];
++    g_default_vkdev[device_index] = 0;
++    return detached;
++}
++
+ static TBuiltInResource get_default_TBuiltInResource()
+ {
+     TBuiltInResource resource;
+@@ -6455,6 +6718,34 @@ int compile_spirv_module(int shader_type_index, const Option& opt, std::vector<u
+     return compile_spirv_module(comp_data, comp_data_size, opt, spirv);
+ }
+ 
++int compile_spirv_module_with_local_size(const char* comp_data, int comp_data_size, const Option& opt,
++                                         uint32_t local_x, uint32_t local_y, uint32_t local_z, std::vector<uint32_t>& spirv)
++{
++    if (!comp_data || comp_data_size <= 0 || !local_x || !local_y || !local_z) return -1;
++    std::string source(comp_data, comp_data_size);
++    // The helper is for trusted sources without a local-size declaration.
++    // Refuse ambiguous declarations, including macro-generated identifiers.
++    if (source.find("local_size_x") != std::string::npos || source.find("local_size_y") != std::string::npos ||
++        source.find("local_size_z") != std::string::npos) return -1;
++    const size_t version = source.find("#version");
++    if (version == std::string::npos || (version != 0 && source[version - 1] != '\n')) return -1;
++    const size_t eol = source.find('\n', version);
++    if (eol == std::string::npos) return -1;
++    source.insert(eol + 1, "layout(local_size_x=" + std::to_string(local_x) +
++                  ",local_size_y=" + std::to_string(local_y) + ",local_size_z=" + std::to_string(local_z) + ") in;\n");
++    if (source.size() > INT_MAX) return -1;
++    return compile_spirv_module(source.data(), (int)source.size(), opt, spirv);
++}
++
++int compile_spirv_module_with_local_size(int shader_type_index, const Option& opt,
++                                         uint32_t local_x, uint32_t local_y, uint32_t local_z, std::vector<uint32_t>& spirv)
++{
++    if (shader_type_index < 0 || shader_type_index >= layer_shader_registry_entry_count) return -1;
++    return compile_spirv_module_with_local_size(layer_shader_registry[shader_type_index].comp_data,
++                                                layer_shader_registry[shader_type_index].comp_data_size,
++                                                opt, local_x, local_y, local_z, spirv);
++}
++
+ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderInfo& shader_info)
+ {
+     shader_info.specialization_count = 0;
+@@ -6473,9 +6764,11 @@ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderIn
+     // binding_id -> binding_type
+     std::vector<int> binding_types;
+ 
++    if (!spv_data || spv_data_size < 5 * sizeof(uint32_t) || spv_data_size % sizeof(uint32_t) ||
++        spv_data[0] != 0x07230203 || !spv_data[3] || spv_data[3] > 0x003fffffu) return -1;
+     const uint32_t* p = spv_data;
+ 
+-    int bound = p[3];
++    int bound = (int)p[3];
+ 
+     id_types.resize(bound);
+ 
+@@ -6504,9 +6797,13 @@ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderIn
+ 
+         uint16_t wordcount = opcode >> 16;
+         uint16_t op = opcode & 0xffff;
++        const size_t remaining = (size_t)((const unsigned char*)spv_data + spv_data_size - (const unsigned char*)p) / sizeof(uint32_t);
++        if (!wordcount || wordcount > remaining) return -1;
+ 
+         if (op == 5) // OpName
+         {
++            if (wordcount < 3 || !p[1] || p[1] >= (uint32_t)bound ||
++                !memchr(&p[2], 0, (wordcount - 2) * sizeof(uint32_t))) return -1;
+             uint32_t id = p[1];
+             const char* name = (const char*)&p[2];
+             if (strcmp(name, "parameter") == 0)
+@@ -6516,6 +6813,8 @@ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderIn
+         }
+         else if (op == 6) // OpMemberName
+         {
++            if (wordcount < 4 || !p[1] || p[1] >= (uint32_t)bound ||
++                !memchr(&p[3], 0, (wordcount - 3) * sizeof(uint32_t))) return -1;
+             uint32_t id = p[1];
+             if (id == parameter_id)
+             {
+@@ -6524,16 +6823,19 @@ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderIn
+         }
+         else if (op == 25) // OpTypeImage
+         {
++            if (wordcount < 9 || !p[1] || p[1] >= (uint32_t)bound) return -1;
+             uint32_t id = p[1];
+             id_types[id] = 2;
+         }
+         else if (op == 27) // OpTypeSampledImage
+         {
++            if (wordcount != 3 || !p[1] || p[1] >= (uint32_t)bound || !p[2] || p[2] >= (uint32_t)bound) return -1;
+             uint32_t id = p[1];
+             id_types[id] = 3;
+         }
+         else if (op == 32) // OpTypePointer
+         {
++            if (wordcount != 4 || !p[1] || p[1] >= (uint32_t)bound || !p[3] || p[3] >= (uint32_t)bound) return -1;
+             uint32_t id = p[1];
+             uint32_t storage_class = p[2];
+             uint32_t type = p[3];
+@@ -6553,6 +6855,7 @@ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderIn
+         }
+         else if (op == 59) // OpVariable
+         {
++            if ((wordcount != 4 && wordcount != 5) || !p[1] || p[1] >= (uint32_t)bound || !p[2] || p[2] >= (uint32_t)bound) return -1;
+             uint32_t id = p[1];
+             uint32_t var_id = p[2];
+             uint32_t storage_class = p[3];
+@@ -6571,9 +6874,11 @@ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderIn
+         }
+         else if (op == 71) // OpDecorate
+         {
++            if (wordcount < 3 || !p[1] || p[1] >= (uint32_t)bound) return -1;
+             uint32_t id = p[1];
+             uint32_t decoration = p[2];
+-            uint32_t binding_id = p[3];
++            if ((decoration == 1 || decoration == 33) && wordcount != 4) return -1;
++            uint32_t binding_id = wordcount >= 4 ? p[3] : 0;
+             if (decoration == 1) // SpecId
+             {
+                 specialization_count++;
+@@ -6584,6 +6889,7 @@ int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderIn
+             }
+             else if (decoration == 33) // Binding
+             {
++                if (binding_id >= 16) return -1;
+ #if NCNN_COVERAGE
+                 if (descriptor_sets[id] != 0)
+                 {
+diff --git a/src/gpu.h b/src/gpu.h
+index 497212f3..795b6d6b 100644
+--- a/src/gpu.h
++++ b/src/gpu.h
+@@ -451,6 +451,18 @@ public:
+ 
+     VkDevice vkdevice() const;
+     bool is_valid() const;
++    // Exact-source factory continuation; caller serializes device access.
++    VkResult initialization_result() const;
++    bool initialization_pending() const;
++    int poll_initialization(uint64_t timeout_ns) const;
++    // Caller first proves all queues of this exact device quiescent.
++    int retire_initialization_device_lost() const;
++    // Meguviz: the exact inputs accepted by vkCreateDevice, not advertised
++    // physical-device capabilities. Extension chain is immutable and device-owned.
++    uint32_t enabled_api_version() const;
++    const VkPhysicalDeviceFeatures& enabled_features() const;
++    const void* enabled_extension_features() const;
++    bool extension_enabled(const char* name) const;
+ 
+ #if NCNN_COVERAGE
+     void bind_shader_coverage(VkCommandBuffer command_buffer, VkPipelineLayout pipeline_layout) const;
+@@ -467,6 +479,9 @@ public:
+     int create_pipeline_layout(int push_constant_count, VkDescriptorSetLayout descriptorset_layout, VkPipelineLayout* pipeline_layout) const;
+     int create_pipeline(VkShaderModule shader_module, VkPipelineLayout pipeline_layout, const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size, VkPipeline* pipeline) const;
+     int create_pipeline(VkShaderModule shader_module, VkPipelineLayout pipeline_layout, const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size, VkPipelineCache pipeline_cache, VkPipeline* pipeline) const;
++    // Internal overload: explicit reserved LocalSizeId values for modules
++    // produced by the SPIR-V 1.6 local-size injector; existing ABI unchanged.
++    int create_pipeline(VkShaderModule shader_module, VkPipelineLayout pipeline_layout, const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size, VkPipelineCache pipeline_cache, const uint32_t* local_size_xyz, VkPipeline* pipeline) const;
+     int create_descriptor_update_template(int binding_count, const int* binding_types, VkDescriptorSetLayout descriptorset_layout, VkPipelineLayout pipeline_layout, VkDescriptorUpdateTemplateKHR* descriptor_update_template) const;
+ 
+     uint32_t find_memory_index(uint32_t memory_type_bits, VkFlags required, VkFlags preferred, VkFlags preferred_not) const;
+@@ -507,6 +522,11 @@ public:
+     // cast_type_to   0=auto(same as src)  1=fp32  2=fp16  3=int32  4=int8  5=bf16
+     void convert_packing(const VkMat& src, VkMat& dst, int dst_elempack, int cast_type_to, VkCompute& cmd, const Option& opt) const;
+ 
++    // Meguviz: enabled before device creation, null when unavailable.
++    PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR;
++    PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR;
++    bool meguviz_sync_fd_enabled;
++
+     // VK_KHR_bind_memory2
+     PFN_vkBindBufferMemory2KHR vkBindBufferMemory2KHR;
+     PFN_vkBindImageMemory2KHR vkBindImageMemory2KHR;
+@@ -575,11 +595,22 @@ private:
+ };
+ 
+ NCNN_EXPORT VulkanDevice* get_gpu_device(int device_index = get_default_gpu_index());
++// Exact-source recovery API. Atomically remove only the expected cached device;
++// no object is destroyed. Caller takes ownership and must keep the VkInstance
++// alive, stop new use and establish quiescence before deleting the old device.
++// A later get_gpu_device(index) creates a separate non-lost logical device.
++NCNN_EXPORT const VulkanDevice* detach_gpu_device(int device_index, const VulkanDevice* expected);
+ 
+ // online spirv compilation
+ NCNN_EXPORT int compile_spirv_module(const char* comp_string, const Option& opt, std::vector<uint32_t>& spirv);
+ NCNN_EXPORT int compile_spirv_module(const char* comp_data, int comp_data_size, const Option& opt, std::vector<uint32_t>& spirv);
+ NCNN_EXPORT int compile_spirv_module(int shader_type_index, const Option& opt, std::vector<uint32_t>& spirv);
++// Compile trusted GLSL with its actual execution size before glslang can fold
++// gl_WorkGroupSize. Callers must supply source without a local-size declaration.
++NCNN_EXPORT int compile_spirv_module_with_local_size(const char* comp_data, int comp_data_size, const Option& opt,
++                                                     uint32_t local_x, uint32_t local_y, uint32_t local_z, std::vector<uint32_t>& spirv);
++NCNN_EXPORT int compile_spirv_module_with_local_size(int shader_type_index, const Option& opt,
++                                                     uint32_t local_x, uint32_t local_y, uint32_t local_z, std::vector<uint32_t>& spirv);
+ 
+ // info from spirv
+ class NCNN_EXPORT ShaderInfo
+diff --git a/src/net.cpp b/src/net.cpp
+index 34438abd..3d13efd9 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -303,6 +303,7 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
+     if (cmd_submit_and_wait)
+     {
+         ret = cmd.submit_and_wait();
++        if (ret != 0) return ret; // Do not reset or query an unresolved hidden batch.
+ 
+ #if NCNN_BENCHMARK
+         std::vector<uint64_t> results(layer_index * 2);
+@@ -319,9 +320,8 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
+         }
+ #endif // NCNN_BENCHMARK
+ 
+-        cmd.reset();
+-        if (ret != 0)
+-            return ret;
++        ret = cmd.reset();
++        if (ret != 0) return ret;
+     }
+ 
+     if (layer->support_vulkan)
+@@ -2329,7 +2329,22 @@ int Net::load_param_bin(const DataReader& dr)
+     return 0;
+ }
+ 
++#if NCNN_VULKAN
+ int Net::load_model(const DataReader& dr)
++{
++    return load_model_impl(dr, 0, UINT64_MAX);
++}
++
++int Net::load_model_with_transfer(const DataReader& dr, VkTransfer* external_transfer, uint64_t wait_ns)
++{
++    if (!external_transfer || wait_ns == UINT64_MAX) return -1;
++    return load_model_impl(dr, external_transfer, wait_ns);
++}
++
++int Net::load_model_impl(const DataReader& dr, VkTransfer* external_transfer, uint64_t wait_ns)
++#else
++int Net::load_model(const DataReader& dr)
++#endif
+ {
+     if (d->layers.empty())
+     {
+@@ -2343,9 +2358,14 @@ int Net::load_model(const DataReader& dr)
+     int ret = 0;
+ 
+ #if NCNN_VULKAN
+-    ncnn::VkTransfer* cmd_upload = 0;
++    ncnn::VkTransfer* cmd_upload = external_transfer;
++    bool owns_upload = false;
+     Option opt_upload = opt;
+ 
++    if (cmd_upload && (!opt.use_vulkan_compute || cmd_upload->vulkan_device() != d->vkdev ||
++                       !cmd_upload->claim_fresh_for_model_load()))
++        return -1;
++
+     if (opt.use_vulkan_compute)
+     {
+         if (!opt.pipeline_cache)
+@@ -2355,7 +2375,16 @@ int Net::load_model(const DataReader& dr)
+             opt.pipeline_cache = d->pipeline_cache;
+         }
+ 
+-        cmd_upload = new ncnn::VkTransfer(d->vkdev);
++        if (!cmd_upload)
++        {
++            cmd_upload = new ncnn::VkTransfer(d->vkdev);
++            owns_upload = true;
++        }
++        if (!cmd_upload->is_valid())
++        {
++            if (owns_upload) delete cmd_upload;
++            return -1;
++        }
+ 
+         // create gpu device allocator if null
+         if (!d->weight_vkallocator)
+@@ -2432,14 +2461,18 @@ int Net::load_model(const DataReader& dr)
+             // commit as soon as we collect 256M pending
+             if (cmd_upload->pending_upload_total() > 256 * 1024 * 1024)
+             {
+-                uret = cmd_upload->submit_and_wait();
++                uret = cmd_upload->submit_and_wait(wait_ns);
+                 if (uret != 0)
+                 {
+                     ret = -1;
+                     break;
+                 }
+ 
+-                cmd_upload->reset();
++                if (cmd_upload->reset() != 0)
++                {
++                    ret = -1;
++                    break;
++                }
+             }
+         }
+ #endif // NCNN_VULKAN
+@@ -2468,10 +2501,10 @@ int Net::load_model(const DataReader& dr)
+ #if NCNN_VULKAN
+     if (ret == 0 && opt.use_vulkan_compute && cmd_upload)
+     {
+-        ret = cmd_upload->submit_and_wait();
++        ret = cmd_upload->submit_and_wait(wait_ns);
+     }
+ 
+-    if (cmd_upload)
++    if (cmd_upload && owns_upload)
+     {
+         delete cmd_upload;
+     }
+@@ -3326,6 +3359,14 @@ int Extractor::extract(int blob_index, Mat& feat, int type)
+ #endif // NCNN_VULKAN
+     }
+ 
++    const int finalized = finish_extract(blob_index, feat, type);
++    set_kmp_blocktime(old_blocktime);
++    set_flush_denormals(old_flush_denormals);
++    return finalized != 0 ? finalized : ret;
++}
++
++int Extractor::finish_extract(int blob_index, Mat& feat, int type)
++{
+     feat = d->blob_mats[blob_index];
+ 
+     // empty is valid for outputs
+@@ -3417,11 +3458,76 @@ int Extractor::extract(int blob_index, Mat& feat, int type)
+         }
+     }
+ 
+-    set_kmp_blocktime(old_blocktime);
+-    set_flush_denormals(old_flush_denormals);
++    return 0;
++}
+ 
++#if NCNN_VULKAN
++namespace {
++struct ExtractorHostState {
++    int blocktime, flush;
++    explicit ExtractorHostState(const Option& opt) : blocktime(get_kmp_blocktime()), flush(get_flush_denormals()) {
++        set_kmp_blocktime(opt.openmp_blocktime); set_flush_denormals(opt.flush_denormals);
++    }
++    ~ExtractorHostState() { set_kmp_blocktime(blocktime); set_flush_denormals(flush); }
++};
++}
++int Extractor::record_extract_host(int blob_index, Mat& feat, VkCompute& cmd, int type)
++{
++    (void)type;
++    if (blob_index < 0 || blob_index >= (int)d->blob_mats.size() || !d->opt.use_vulkan_compute || !cmd.is_valid()) return -1;
++    if (d->opt.kvcache_allocator && d->opt.kvcache_allocator == d->opt.blob_allocator) return -1;
++#if NCNN_BATCH
++    if (d->opt.kvcache_allocator) {
++        for (size_t i = 0; i < d->blob_mats.size(); i++) if (d->blob_mats[i].n > 1) return -1;
++    }
++#endif
++    ExtractorHostState host_state(d->opt);
++    int ret = 0;
++    if (d->blob_mats[blob_index].dims == 0) {
++        // Identical policy to extract(Mat): CPU local allocator selection must
++        // precede the Vulkan extractor, including its CPU fallback layers.
++        if (d->opt.use_local_pool_allocator) {
++            if (!d->opt.blob_allocator) d->opt.blob_allocator = d->net->d->local_blob_allocator;
++            if (!d->opt.workspace_allocator) d->opt.workspace_allocator = d->net->d->local_workspace_allocator;
++        }
++        if (!d->opt.blob_vkallocator) {
++            d->local_blob_vkallocator = d->net->vulkan_device()->acquire_blob_allocator();
++            d->opt.blob_vkallocator = d->local_blob_vkallocator;
++        }
++        if (!d->opt.workspace_vkallocator) d->opt.workspace_vkallocator = d->opt.blob_vkallocator;
++        if (!d->opt.staging_vkallocator) {
++            d->local_staging_vkallocator = d->net->vulkan_device()->acquire_staging_allocator();
++            d->opt.staging_vkallocator = d->local_staging_vkallocator;
++        }
++        VkMat feat_gpu;
++        ret = extract(blob_index, feat_gpu, cmd);
++        if (ret == 0 && d->blob_mats[blob_index].dims == 0 && feat_gpu.dims != 0)
++            cmd.record_download(feat_gpu, d->blob_mats[blob_index], d->opt);
++    }
++    // Storage may not yet contain finalized host values. It stays owned by this
++    // Extractor; the caller must not inspect it until retirement and finalize.
++    feat = d->blob_mats[blob_index];
+     return ret;
+ }
++int Extractor::finish_extract_host(int blob_index, Mat& feat, int type)
++{
++    if (blob_index < 0 || blob_index >= (int)d->blob_mats.size() || !d->opt.use_vulkan_compute) return -1;
++    ExtractorHostState host_state(d->opt);
++    return finish_extract(blob_index, feat, type);
++}
++#if NCNN_STRING
++int Extractor::record_extract_host(const char* blob_name, Mat& feat, VkCompute& cmd, int type)
++{
++    const int index = d->net->find_blob_index_by_name(blob_name);
++    return index < 0 ? -1 : record_extract_host(index, feat, cmd, type);
++}
++int Extractor::finish_extract_host(const char* blob_name, Mat& feat, int type)
++{
++    const int index = d->net->find_blob_index_by_name(blob_name);
++    return index < 0 ? -1 : finish_extract_host(index, feat, type);
++}
++#endif
++#endif
+ 
+ #if NCNN_VULKAN
+ #if NCNN_STRING
+diff --git a/src/net.h b/src/net.h
+index 0849131d..eed96f17 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -20,6 +20,7 @@ namespace ncnn {
+ 
+ #if NCNN_VULKAN
+ class VkCompute;
++class VkTransfer;
+ #endif // NCNN_VULKAN
+ class DataReader;
+ class Extractor;
+@@ -67,6 +68,15 @@ public:
+ 
+     int load_model(const DataReader& dr);
+ 
++#if NCNN_VULKAN
++    // Private exact-source SDK seam. The transfer must be fresh, valid and
++    // owned before this call. The caller must keep Net, model data, transfer,
++    // allocator and device alive until all transfer batches physically retire.
++    // wait_ns is finite and applies per batch, not to the entire load call.
++    // A failure can leave pending batches; consult the transfer before cleanup.
++    int load_model_with_transfer(const DataReader& dr, VkTransfer* external_transfer, uint64_t wait_ns);
++#endif
++
+ #if NCNN_STDIO
+ #if NCNN_STRING
+     // load network structure from plain param file
+@@ -159,6 +169,9 @@ protected:
+     virtual Layer* create_overwrite_builtin_layer(int typeindex);
+ 
+ private:
++#if NCNN_VULKAN
++    int load_model_impl(const DataReader& dr, VkTransfer* external_transfer, uint64_t wait_ns);
++#endif
+     Net(const Net&);
+     Net& operator=(const Net&);
+ 
+@@ -231,7 +244,15 @@ public:
+     int extract(int blob_index, Mat& feat, int type = 0);
+ 
+ #if NCNN_VULKAN
++    // Exact-source owner split. record preserves the original host-extract
++    // allocator/Options policy but does not submit or run host postprocessing.
++    // The caller keeps this Extractor, command and all external data alive,
++    // retires/finalizes the command, then calls finish on the same blob/type.
++    int record_extract_host(int blob_index, Mat& feat, VkCompute& cmd, int type = 0);
++    int finish_extract_host(int blob_index, Mat& feat, int type = 0);
+ #if NCNN_STRING
++    int record_extract_host(const char* blob_name, Mat& feat, VkCompute& cmd, int type = 0);
++    int finish_extract_host(const char* blob_name, Mat& feat, int type = 0);
+     // set input by blob name
+     // return 0 if success
+     int input(const char* blob_name, const VkMat& in);
+@@ -255,6 +276,7 @@ protected:
+     Extractor(const Net* net, size_t blob_count);
+ 
+ private:
++    int finish_extract(int blob_index, Mat& feat, int type);
+     ExtractorPrivate* const d;
+ };
+ 
+diff --git a/src/pipeline.cpp b/src/pipeline.cpp
+index 60bbcdfd..b045d1e7 100644
+--- a/src/pipeline.cpp
++++ b/src/pipeline.cpp
+@@ -30,6 +30,7 @@ public:
+     uint32_t local_size_y;
+     uint32_t local_size_z;
+     uint32_t subgroup_size;
++    std::shared_ptr<void> direct_resource_owner;
+ };
+ 
+ Pipeline::Pipeline(const VulkanDevice* _vkdev)
+@@ -311,8 +312,32 @@ void Pipeline::set_shader_info(const ShaderInfo& shader_info)
+     d->shader_info = shader_info;
+ }
+ 
++std::shared_ptr<void> Pipeline::direct_resource_owner() const { return d->direct_resource_owner; }
++void Pipeline::set_direct_resource_owner(const std::shared_ptr<void>& owner) { d->direct_resource_owner = owner; }
++
+ #if NCNN_PLATFORM_API
+ #if __ANDROID_API__ >= 26
++namespace {
++struct DirectYcbcrResources
++{
++    const VulkanDevice* device;
++    VkShaderModule shader;
++    VkDescriptorSetLayout descriptor;
++    VkPipelineLayout layout;
++    VkPipeline pipeline;
++    VkDescriptorUpdateTemplateKHR update_template;
++    VkSampler sampler;
++    ~DirectYcbcrResources()
++    {
++        if (update_template) device->vkDestroyDescriptorUpdateTemplateKHR(device->vkdevice(), update_template, 0);
++        if (pipeline) vkDestroyPipeline(device->vkdevice(), pipeline, 0);
++        if (layout) vkDestroyPipelineLayout(device->vkdevice(), layout, 0);
++        if (descriptor) vkDestroyDescriptorSetLayout(device->vkdevice(), descriptor, 0);
++        if (sampler) vkDestroySampler(device->vkdevice(), sampler, 0);
++        if (shader) vkDestroyShaderModule(device->vkdevice(), shader, 0);
++    }
++};
++}
+ ImportAndroidHardwareBufferPipeline::ImportAndroidHardwareBufferPipeline(const VulkanDevice* _vkdev)
+     : Pipeline(_vkdev)
+ {
+@@ -326,10 +351,11 @@ ImportAndroidHardwareBufferPipeline::~ImportAndroidHardwareBufferPipeline()
+ 
+ int ImportAndroidHardwareBufferPipeline::create(VkAndroidHardwareBufferImageAllocator* ahb_im_allocator, int _type_to, int _rotate_from, const Option& opt)
+ {
++    if (!ahb_im_allocator) return -1;
+     int target_width;
+     int target_height;
+ 
+-    if (rotate_from < 5) // 1 2 3 4
++    if (_rotate_from < 5) // 1 2 3 4
+     {
+         target_width = ahb_im_allocator->width();
+         target_height = ahb_im_allocator->height();
+@@ -345,6 +371,12 @@ int ImportAndroidHardwareBufferPipeline::create(VkAndroidHardwareBufferImageAllo
+ 
+ int ImportAndroidHardwareBufferPipeline::create(VkAndroidHardwareBufferImageAllocator* ahb_im_allocator, int _type_to, int _rotate_from, int target_width, int target_height, const Option& opt)
+ {
++    // This direct path owns its Vulkan objects (unlike PipelineCache). Reuse
++    // requires the prior work to be retired and destroy() to have run first.
++    if (!ahb_im_allocator || _type_to < 1 || _type_to > 5 || _rotate_from < 1 || _rotate_from > 8 ||
++        target_width <= 0 || target_height <= 0 || shader_module() || descriptorset_layout() || pipeline_layout() || pipeline() || descriptor_update_template() || sampler)
++        return -1;
++    const auto fail = [this]() { destroy(); return -1; };
+     int w = ahb_im_allocator->width();
+     int h = ahb_im_allocator->height();
+ 
+@@ -393,47 +425,91 @@ int ImportAndroidHardwareBufferPipeline::create(VkAndroidHardwareBufferImageAllo
+     specializations[5].i = rotate_from;
+     specializations[6].i = need_resize;
+ 
+-    create_shader_module(opt);
++    if (create_shader_module(opt) != 0)
++        return fail();
+ 
+     const ShaderInfo& _shader_info = shader_info();
+ 
+     if ((int)specializations.size() != _shader_info.specialization_count)
+     {
+         NCNN_LOGE("pipeline convert_ycbcr specialization count mismatch, expect %d but got %d", _shader_info.specialization_count, (int)specializations.size());
+-        return -1;
++        return fail();
+     }
+ 
+-    create_sampler(ahb_im_allocator);
++    if (create_sampler(ahb_im_allocator) != 0)
++        return fail();
+ 
+-    create_descriptorset_layout();
++    if (create_descriptorset_layout() != 0)
++        return fail();
+ 
+     VkPipelineLayout pipeline_layout = 0;
+     VkPipeline pipeline = 0;
+     VkDescriptorUpdateTemplateKHR descriptor_update_template = 0;
+ 
+-    vkdev->create_pipeline_layout(_shader_info.push_constant_count, descriptorset_layout(), &pipeline_layout);
++    if (vkdev->create_pipeline_layout(_shader_info.push_constant_count, descriptorset_layout(), &pipeline_layout) != 0)
++        return fail();
++    set_pipeline_layout(pipeline_layout);
+ 
+-    vkdev->create_pipeline(shader_module(), pipeline_layout, specializations, vkdev->info.subgroup_size(), &pipeline);
++    // The SPIR-V 1.6 injector emits LocalSizeId with reserved SpecIds. Some
++    // Android drivers require explicit values even when defaults match.
++    const uint32_t local_size_xyz[] = {local_size_x(), local_size_y(), local_size_z()};
++    const uint32_t* explicit_local_size = vkdev->info.queryMaintenance4Features().maintenance4 ? local_size_xyz : 0;
++    if (vkdev->create_pipeline(shader_module(), pipeline_layout, specializations, vkdev->info.subgroup_size(), 0,
++                               explicit_local_size, &pipeline) != 0)
++    {
++        return fail();
++    }
++    set_pipeline(pipeline);
+ 
+     if (vkdev->info.support_VK_KHR_descriptor_update_template())
+     {
+-        vkdev->create_descriptor_update_template(_shader_info.binding_count, _shader_info.binding_types, descriptorset_layout(), pipeline_layout, &descriptor_update_template);
++        if (vkdev->create_descriptor_update_template(_shader_info.binding_count, _shader_info.binding_types, descriptorset_layout(), pipeline_layout, &descriptor_update_template) != 0)
++        {
++            return fail();
++        }
+     }
+ 
+-    set_pipeline_layout(pipeline_layout);
+-    set_pipeline(pipeline);
+     set_descriptor_update_template(descriptor_update_template);
+ 
++    // Publish an independently retained owner only after every step succeeded.
++    // A command may outlive this C++ wrapper but not the Vulkan device/allocator.
++    try
++    {
++        auto owner = std::make_shared<DirectYcbcrResources>();
++        owner->device=vkdev;owner->shader=shader_module();owner->descriptor=descriptorset_layout();
++        owner->layout=pipeline_layout;owner->pipeline=pipeline;owner->update_template=descriptor_update_template;owner->sampler=sampler;
++        set_direct_resource_owner(owner);
++    }
++    catch (...) { return fail(); }
++
+     return 0;
+ }
+ 
+ void ImportAndroidHardwareBufferPipeline::destroy()
+ {
++    // The command's strong owner survives this wrapper through retirement.
++    // Concurrent destruction during record_import itself remains prohibited.
++    auto owner = direct_resource_owner();
++    if (owner)
++    {
++        set_shader_module(0);set_descriptorset_layout(0);set_pipeline_layout(0);set_pipeline(0);
++        set_descriptor_update_template(0);sampler=0;set_direct_resource_owner(std::shared_ptr<void>());
++        return;
++    }
++    if (descriptor_update_template())
++    {
++        vkdev->vkDestroyDescriptorUpdateTemplateKHR(vkdev->vkdevice(), descriptor_update_template(), 0);
++        set_descriptor_update_template(0);
++    }
++    if (pipeline()) { vkDestroyPipeline(vkdev->vkdevice(), pipeline(), 0); set_pipeline(0); }
++    if (pipeline_layout()) { vkDestroyPipelineLayout(vkdev->vkdevice(), pipeline_layout(), 0); set_pipeline_layout(0); }
++    if (descriptorset_layout()) { vkDestroyDescriptorSetLayout(vkdev->vkdevice(), descriptorset_layout(), 0); set_descriptorset_layout(0); }
+     if (sampler)
+     {
+         vkDestroySampler(vkdev->vkdevice(), sampler, 0);
+         sampler = 0;
+     }
++    if (shader_module()) { vkDestroyShaderModule(vkdev->vkdevice(), shader_module(), 0); set_shader_module(0); }
+ }
+ 
+ int ImportAndroidHardwareBufferPipeline::create_shader_module(const Option& opt)
+@@ -441,7 +517,7 @@ int ImportAndroidHardwareBufferPipeline::create_shader_module(const Option& opt)
+     int shader_type_index = LayerShaderType::convert_ycbcr;
+ 
+     std::vector<uint32_t> spirv;
+-    int retc = compile_spirv_module(shader_type_index, opt, spirv);
++    int retc = compile_spirv_module_with_local_size(shader_type_index, opt, local_size_x(), local_size_y(), local_size_z(), spirv);
+     if (retc != 0)
+     {
+         NCNN_LOGE("compile_spirv_module failed %d", retc);
+@@ -462,6 +538,7 @@ int ImportAndroidHardwareBufferPipeline::create_shader_module(const Option& opt)
+     set_shader_info(shader_info);
+ 
+     VkShaderModule shader_module = vkdev->compile_shader_module(spv_data, spv_data_size, local_size_x(), local_size_y(), local_size_z());
++    if (!shader_module) return -1;
+     set_shader_module(shader_module);
+ 
+     return 0;
+diff --git a/src/pipeline.h b/src/pipeline.h
+index 0a3a9ba9..3913aa25 100644
+--- a/src/pipeline.h
++++ b/src/pipeline.h
+@@ -6,6 +6,7 @@
+ 
+ #include "mat.h"
+ #include "platform.h"
++#include <memory>
+ #if NCNN_VULKAN
+ #include "gpu.h"
+ #endif // NCNN_VULKAN
+@@ -53,6 +54,11 @@ protected:
+ 
+     void set_shader_info(const ShaderInfo& shader_info);
+ 
++    // Direct Android import pipelines own resources rather than borrowing the
++    // PipelineCache. A command retains this owner through GPU retirement.
++    std::shared_ptr<void> direct_resource_owner() const;
++    void set_direct_resource_owner(const std::shared_ptr<void>& owner);
++
+ public:
+     const VulkanDevice* vkdev;
+ 
+diff --git a/src/pipelinecache.cpp b/src/pipelinecache.cpp
+index a74a073b..d5df32bf 100644
+--- a/src/pipelinecache.cpp
++++ b/src/pipelinecache.cpp
+@@ -23,15 +23,138 @@ namespace ncnn {
+ #if NCNN_VULKAN
+ #define NCNN_PIPELINE_CACHE_FILE_MAGIC 0x5a545546
+ #if NCNN_COVERAGE
+-#define NCNN_PIPELINE_CACHE_FILE_VERSION 0x00010003
++#define NCNN_PIPELINE_CACHE_FILE_VERSION 0x00010004
+ #else
+-#define NCNN_PIPELINE_CACHE_FILE_VERSION 3
++#define NCNN_PIPELINE_CACHE_FILE_VERSION 4
+ #endif
+ #define NCNN_PIPELINE_CACHE_FILE_ENDIAN  0x12345678
+ #define NCNN_PIPELINE_CACHE_NCNN_VERSION NCNN_VERSION_NUMBER
+ 
+ uint64_t get_shader_source_hash(int shader_type_index);
+ 
++// The 1.6 injector replaces LocalSize with LocalSizeId using SpecIds 233..235.
++// Some drivers require explicit pipeline map values. Preserve inputs that use
++// the established local-size convention, but reject unrelated uses of those
++// reserved IDs instead of silently rewriting user specialization constants.
++static int local_size_specialization_mode(const uint32_t* words, size_t bytes, unsigned* local_specialization_count = 0,
++                                          uint32_t requested_x = 0, uint32_t requested_y = 0, uint32_t requested_z = 0)
++{
++    if(local_specialization_count)*local_specialization_count=0;
++    if (!words || bytes < 5 * sizeof(uint32_t) || bytes % sizeof(uint32_t) || words[0] != 0x07230203 ||
++        !words[3] || words[3] > 0x003fffffu) return -1;
++    const bool inject_local_size_id = words[1] >= 0x00010600;
++    struct Reserved { uint32_t id; unsigned axis; bool local; } reserved[24];
++    unsigned reserved_count = 0,entry_count=0;bool mode = false,mode_id = false;uint32_t axes[3] = {0,0,0},literal[3] = {0,0,0},workgroup = 0,entry_id=0,mode_entry_id=0;
++    const size_t n = bytes / sizeof(uint32_t);
++    for (size_t i = 5; i < n;)
++    {
++        const uint32_t count = words[i] >> 16, op = words[i] & 65535u;
++        if (!count || count > n - i) return -1;
++        // The downstream local-size injector reads these operands directly.
++        if ((op == 21 && count != 4) || (op == 50 && count < 4) || (op == 51 && count < 3)) return -1;
++        if(op==15)
++        {
++            // ncnn's pipeline always selects the single compute entry "main".
++            // Do not rewrite a local size belonging to a different entry.
++            if(count<5||++entry_count!=1||words[i+1]!=5||words[i+3]!=0x6e69616du||words[i+4]!=0)return -1;
++            entry_id=words[i+2];
++        }
++        if (op == 16 || op == 331)
++        {
++            if (count < 3) return -1;
++            if ((op == 16 && words[i + 2] == 17) || (op == 331 && words[i + 2] == 38))
++            { if (count != 6 || mode) return -1;mode = true;mode_id = op == 331;mode_entry_id=words[i+1];for(unsigned axis=0;axis<3;axis++)(mode_id?axes[axis]:literal[axis])=words[i+3+axis]; }
++        }
++        if (op == 71)
++        {
++            if (count < 3) return -1;
++            if (words[i + 2] == 1)
++            {
++                if(count != 4) return -1;
++                if(words[i+3]>=233 && words[i+3]<=235){
++                    if(reserved_count==24) return -1;
++                    for(unsigned k=0;k<reserved_count;k++)if(reserved[k].id==words[i+1])return -1;
++                    reserved[reserved_count++]={words[i+1],unsigned(words[i+3]-233),false};
++                }
++            }
++            if(words[i+2]==11){if(count!=4)return -1;if(words[i+3]==25){if(workgroup)return -1;workgroup=words[i+1];}}
++        }
++        i += count;
++    }
++    if(entry_count!=1||!mode||mode_entry_id!=entry_id||(!inject_local_size_id&&mode_id))return -1;
++    auto axis_of=[&](uint32_t id)->int{for(unsigned i=0;i<reserved_count;i++)if(reserved[i].id==id)return int(reserved[i].axis);return -1;};
++    bool all_local_axes=mode_id,workgroup_recognized=false,literal_workgroup=false;
++    if(mode_id)for(unsigned axis=0;axis<3;axis++)if(axis_of(axes[axis])!=int(axis))all_local_axes=false;
++    // LocalSizeId may legally refer to ordinary OpConstant IDs. Those IDs can
++    // also be used by shader instructions, and replacing only the execution
++    // mode would silently change their meaning. Accept this form only when all
++    // three original scalar constants can be established and already equal the
++    // requested dimensions. Non-reserved specialization axes remain ambiguous.
++    if(mode_id&&!all_local_axes){
++        const uint32_t requested[3]={requested_x,requested_y,requested_z};
++        for(unsigned axis=0;axis<3;axis++){
++            if(!requested[axis])return -1;
++            bool found=false;
++            for(size_t j=5;j<n;){const uint32_t c=words[j]>>16,o=words[j]&65535u;
++                if(o==43&&c==4&&words[j+2]==axes[axis]&&words[j+3]==requested[axis]){
++                    const uint32_t type=words[j+1];
++                    for(size_t k=5;k<n;){const uint32_t t=words[k]>>16,q=words[k]&65535u;
++                        if(q==21&&t==4&&words[k+1]==type&&words[k+2]==32&&words[k+3]==0)found=true;
++                        k+=t;}
++                }
++                j+=c;}
++            if(!found)return -1;
++        }
++    }
++    if(all_local_axes)for(unsigned i=0;i<reserved_count;i++)if(reserved[i].id==axes[reserved[i].axis])reserved[i].local=true;
++    for(size_t i=5;i<n;){const uint32_t count=words[i]>>16,op=words[i]&65535u;
++        if(op==51&&count==6&&axis_of(words[i+3])==0&&axis_of(words[i+4])==1&&axis_of(words[i+5])==2){
++            const uint32_t composite=words[i+2];
++            if(composite==workgroup||(inject_local_size_id&&all_local_axes)){
++                if(composite==workgroup)workgroup_recognized=true;
++                for(unsigned k=0;k<reserved_count;k++)if(reserved[k].id==words[i+3+reserved[k].axis])reserved[k].local=true;}
++        }
++        // A literal WorkgroupSize may already be folded by glslang into a
++        // shared OpConstant used by ordinary instructions. Rewriting only
++        // the composite cannot restore the original expression. Recognize
++        // the decorated 1.3 form and conservatively treat matching uvec3
++        // constant composites as ambiguous in 1.6 (where the decoration may
++        // have been removed). Do not alter its requested execution size.
++        if(!mode_id&&op==44&&count==6&&(words[i+2]==workgroup||inject_local_size_id)){
++            uint32_t element_type=0;bool vector_type=false,unsigned_type=false;
++            for(size_t j=5;j<n;){const uint32_t c=words[j]>>16,o=words[j]&65535u;
++                if(o==23&&c==4&&words[j+1]==words[i+1]&&words[j+3]==3){element_type=words[j+2];vector_type=true;}
++                j+=c;}
++            if(vector_type)for(size_t j=5;j<n;){const uint32_t c=words[j]>>16,o=words[j]&65535u;
++                if(o==21&&c==4&&words[j+1]==element_type&&words[j+2]==32&&words[j+3]==0)unsigned_type=true;
++                j+=c;}
++            bool matches=unsigned_type;
++            for(unsigned axis=0;axis<3&&matches;axis++){
++                bool found=false;
++                for(size_t j=5;j<n;){const uint32_t c=words[j]>>16,o=words[j]&65535u;
++                    if(o==43&&c==4&&words[j+1]==element_type&&words[j+2]==words[i+3+axis]&&words[j+3]==literal[axis])found=true;
++                    j+=c;}
++                if(!found)matches=false;
++            }
++            if(matches){literal_workgroup=true;if(words[i+2]==workgroup)workgroup_recognized=true;}
++        }
++        i+=count;
++    }
++    for(unsigned i=0;i<reserved_count;i++)if(!reserved[i].local)return -1;
++    if(workgroup&&!workgroup_recognized)return -1;
++    // An optimizer can erase every trace of a folded gl_WorkGroupSize while
++    // retaining the resulting literal in ordinary instructions. For raw
++    // modules without the reserved-axis convention, execution-size changes
++    // cannot be justified from SPIR-V alone. Trusted GLSL callers compile with
++    // their actual size before reaching this gate.
++    if(!mode_id&&reserved_count==0&&requested_x&&requested_y&&requested_z&&
++       (requested_x!=literal[0]||requested_y!=literal[1]||requested_z!=literal[2]))return -1;
++    if(literal_workgroup&&requested_x&&requested_y&&requested_z&&
++       (requested_x!=literal[0]||requested_y!=literal[1]||requested_z!=literal[2]))return -1;
++    if(local_specialization_count)*local_specialization_count=reserved_count;
++    return inject_local_size_id && mode ? 1 : 0;
++}
++
+ // https://en.wikipedia.org/wiki/MurmurHash
+ static uint32_t murmur3_32(const uint32_t* data, int size)
+ {
+@@ -177,6 +300,9 @@ public:
+         uint32_t spv_size;
+         uint32_t spv_hash_fnv1a;
+         uint32_t spv_hash_murmur3;
++        uint32_t local_size_x;
++        uint32_t local_size_y;
++        uint32_t local_size_z;
+         uint32_t reserved[1];
+     };
+ 
+@@ -185,6 +311,9 @@ public:
+         int shader_type_index;
+         uint32_t opt_bits;
+         uint64_t shader_source_hash;
++        uint32_t local_size_x;
++        uint32_t local_size_y;
++        uint32_t local_size_z;
+         std::vector<uint32_t> spirv;
+         ShaderInfo shader_info;
+     };
+@@ -526,6 +655,9 @@ int PipelineCache::save_cache(std::vector<unsigned char>& data) const
+         entry_header.shader_type_index = entry.shader_type_index;
+         entry_header.opt_bits = entry.opt_bits;
+         entry_header.shader_source_hash = entry.shader_source_hash;
++        entry_header.local_size_x = entry.local_size_x;
++        entry_header.local_size_y = entry.local_size_y;
++        entry_header.local_size_z = entry.local_size_z;
+         entry_header.spv_size = (uint32_t)spv_size;
+         entry_header.spv_hash_fnv1a = fnv1a_32((const uint8_t*)entry.spirv.data(), (int)spv_size);
+         entry_header.spv_hash_murmur3 = murmur3_32(entry.spirv.data(), (int)entry.spirv.size());
+@@ -642,6 +774,8 @@ int PipelineCache::load_cache(const unsigned char* data, size_t size) const
+             NCNN_LOGE("spirv entry shader source hash mismatch");
+             return -1;
+         }
++        if (!entry_header.local_size_x || !entry_header.local_size_y || !entry_header.local_size_z)
++            return -1;
+         if (entry_header.spv_size == 0 || entry_header.spv_size % 4 != 0)
+             return -1;
+         if (entry_header.spv_size > header.spirv_cache_size - spirv_offset)
+@@ -670,7 +804,9 @@ int PipelineCache::load_cache(const unsigned char* data, size_t size) const
+ 
+         for (size_t j = 0; j < cache_spirv_entries.size(); j++)
+         {
+-            if (cache_spirv_entries[j].shader_type_index == entry_header.shader_type_index && cache_spirv_entries[j].opt_bits == entry_header.opt_bits)
++            if (cache_spirv_entries[j].shader_type_index == entry_header.shader_type_index && cache_spirv_entries[j].opt_bits == entry_header.opt_bits &&
++                cache_spirv_entries[j].local_size_x == entry_header.local_size_x && cache_spirv_entries[j].local_size_y == entry_header.local_size_y &&
++                cache_spirv_entries[j].local_size_z == entry_header.local_size_z)
+             {
+                 NCNN_LOGE("duplicate spirv cache entry");
+                 return -1;
+@@ -688,6 +824,9 @@ int PipelineCache::load_cache(const unsigned char* data, size_t size) const
+         entry.shader_type_index = entry_header.shader_type_index;
+         entry.opt_bits = entry_header.opt_bits;
+         entry.shader_source_hash = entry_header.shader_source_hash;
++        entry.local_size_x = entry_header.local_size_x;
++        entry.local_size_y = entry_header.local_size_y;
++        entry.local_size_z = entry_header.local_size_z;
+         entry.spirv = spirv;
+         entry.shader_info = si;
+         cache_spirv_entries.push_back(entry);
+@@ -958,6 +1097,10 @@ int PipelineCache::get_pipeline(const uint32_t* spv_data, size_t spv_data_size,
+                                 VkDescriptorUpdateTemplateKHR* descriptor_update_template,
+                                 ShaderInfo& shader_info) const
+ {
++    unsigned local_specialization_count=0;
++    const int explicit_local_size = local_size_specialization_mode(spv_data, spv_data_size, &local_specialization_count,
++                                                                   local_size_x, local_size_y, local_size_z);
++    if (explicit_local_size < 0 || (explicit_local_size && specializations.size() > 233)) return -1;
+     MutexLockGuard lock(d->cache_lock);
+ 
+     PipelineCachePrivate::pipeline_cache_digest key(spv_data, spv_data_size, specializations, local_size_x, local_size_y, local_size_z, subgroup_size);
+@@ -994,6 +1137,8 @@ int PipelineCache::get_pipeline(const uint32_t* spv_data, size_t spv_data_size,
+         NCNN_LOGE("resolve_shader_info failed %d", ret);
+         return -1;
+     }
++    if(shader_info.specialization_count < int(local_specialization_count))return -1;
++    shader_info.specialization_count-=int(local_specialization_count);
+ 
+     VkShaderModule shader_module = vkdev->compile_shader_module(spv_data, spv_data_size, local_size_x, local_size_y, local_size_z);
+     if (!shader_module)
+@@ -1002,7 +1147,8 @@ int PipelineCache::get_pipeline(const uint32_t* spv_data, size_t spv_data_size,
+         return -1;
+     }
+ 
+-    ret = new_pipeline(shader_module, shader_info, specializations, subgroup_size, descriptorset_layout, pipeline_layout, pipeline, descriptor_update_template);
++    const uint32_t local_size_xyz[] = {local_size_x, local_size_y, local_size_z};
++    ret = new_pipeline(shader_module, shader_info, specializations, subgroup_size, explicit_local_size ? local_size_xyz : 0, descriptorset_layout, pipeline_layout, pipeline, descriptor_update_template);
+     if (ret != 0)
+     {
+         NCNN_LOGE("new_pipeline failed");
+@@ -1073,14 +1219,16 @@ int PipelineCache::get_pipeline(int shader_type_index, const Option& opt, const
+ 
+     // create new pipeline
+     VkShaderModule shader_module = 0;
+-    ret = create_shader_module(shader_type_index, opt, local_size_x, local_size_y, local_size_z, &shader_module, shader_info);
++    bool explicit_local_size = false;
++    ret = create_shader_module(shader_type_index, opt, local_size_x, local_size_y, local_size_z, &shader_module, shader_info, &explicit_local_size);
+     if (ret != 0)
+     {
+         NCNN_LOGE("create_shader_module failed");
+         return -1;
+     }
+ 
+-    ret = new_pipeline(shader_module, shader_info, specializations, subgroup_size, descriptorset_layout, pipeline_layout, pipeline, descriptor_update_template);
++    const uint32_t local_size_xyz[] = {local_size_x, local_size_y, local_size_z};
++    ret = new_pipeline(shader_module, shader_info, specializations, subgroup_size, explicit_local_size ? local_size_xyz : 0, descriptorset_layout, pipeline_layout, pipeline, descriptor_update_template);
+     if (ret != 0)
+     {
+         NCNN_LOGE("new_pipeline failed");
+@@ -1113,6 +1261,13 @@ int PipelineCache::get_pipeline(int shader_type_index, const Option& opt, const
+ int PipelineCache::create_shader_module(int shader_type_index, const Option& opt,
+                                         uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z,
+                                         VkShaderModule* _shader_module, ShaderInfo& si) const
++{
++    return create_shader_module(shader_type_index, opt, local_size_x, local_size_y, local_size_z, _shader_module, si, 0);
++}
++
++int PipelineCache::create_shader_module(int shader_type_index, const Option& opt,
++                                        uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z,
++                                        VkShaderModule* _shader_module, ShaderInfo& si, bool* explicit_local_size) const
+ {
+     std::vector<uint32_t> spirv;
+     const std::vector<uint32_t>* spirv_ptr = 0;
+@@ -1125,7 +1280,8 @@ int PipelineCache::create_shader_module(int shader_type_index, const Option& opt
+         for (size_t i = 0; i < d->cache_spirv_entries.size(); i++)
+         {
+             const PipelineCachePrivate::spirv_cache_entry& entry = d->cache_spirv_entries[i];
+-            if (entry.shader_type_index != shader_type_index || entry.opt_bits != opt_bits || entry.shader_source_hash != shader_source_hash)
++            if (entry.shader_type_index != shader_type_index || entry.opt_bits != opt_bits || entry.shader_source_hash != shader_source_hash ||
++                entry.local_size_x != local_size_x || entry.local_size_y != local_size_y || entry.local_size_z != local_size_z)
+                 continue;
+ 
+             spirv_ptr = &entry.spirv;
+@@ -1136,7 +1292,7 @@ int PipelineCache::create_shader_module(int shader_type_index, const Option& opt
+ 
+     if (!spirv_ptr)
+     {
+-        int retc = compile_spirv_module(shader_type_index, opt, spirv);
++        int retc = compile_spirv_module_with_local_size(shader_type_index, opt, local_size_x, local_size_y, local_size_z, spirv);
+         if (retc != 0)
+         {
+             NCNN_LOGE("compile_spirv_module failed %d", retc);
+@@ -1159,6 +1315,9 @@ int PipelineCache::create_shader_module(int shader_type_index, const Option& opt
+             entry.shader_type_index = shader_type_index;
+             entry.opt_bits = opt_bits;
+             entry.shader_source_hash = shader_source_hash;
++            entry.local_size_x = local_size_x;
++            entry.local_size_y = local_size_y;
++            entry.local_size_z = local_size_z;
+             entry.spirv = spirv;
+             entry.shader_info = si;
+ 
+@@ -1166,7 +1325,8 @@ int PipelineCache::create_shader_module(int shader_type_index, const Option& opt
+             for (size_t i = 0; i < d->cache_spirv_entries.size(); i++)
+             {
+                 PipelineCachePrivate::spirv_cache_entry& old_entry = d->cache_spirv_entries[i];
+-                if (old_entry.shader_type_index != shader_type_index || old_entry.opt_bits != opt_bits)
++                if (old_entry.shader_type_index != shader_type_index || old_entry.opt_bits != opt_bits ||
++                    old_entry.local_size_x != local_size_x || old_entry.local_size_y != local_size_y || old_entry.local_size_z != local_size_z)
+                     continue;
+ 
+                 old_entry = entry;
+@@ -1184,6 +1344,15 @@ int PipelineCache::create_shader_module(int shader_type_index, const Option& opt
+     const uint32_t* spv_data = spirv_ptr->data();
+     size_t spv_data_size = spirv_ptr->size() * 4;
+ 
++    unsigned local_specialization_count=0;
++    const int local_mode = local_size_specialization_mode(spv_data, spv_data_size, &local_specialization_count,
++                                                          local_size_x, local_size_y, local_size_z);
++    if (local_mode < 0) return -1;
++    if (explicit_local_size){
++        if(si.specialization_count<int(local_specialization_count))return -1;
++        si.specialization_count-=int(local_specialization_count);*explicit_local_size = local_mode != 0;
++    }
++
+     VkShaderModule shader_module = vkdev->compile_shader_module(spv_data, spv_data_size, local_size_x, local_size_y, local_size_z);
+ 
+     if (!shader_module)
+@@ -1203,6 +1372,15 @@ int PipelineCache::new_pipeline(VkShaderModule shader_module, const ShaderInfo&
+                                 VkPipelineLayout* _pipeline_layout,
+                                 VkPipeline* _pipeline,
+                                 VkDescriptorUpdateTemplateKHR* _descriptor_update_template) const
++{
++    return new_pipeline(shader_module, shader_info, specializations, subgroup_size, 0, _descriptorset_layout, _pipeline_layout, _pipeline, _descriptor_update_template);
++}
++
++int PipelineCache::new_pipeline(VkShaderModule shader_module, const ShaderInfo& shader_info,
++                                const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size,
++                                const uint32_t* local_size_xyz, VkDescriptorSetLayout* _descriptorset_layout,
++                                VkPipelineLayout* _pipeline_layout, VkPipeline* _pipeline,
++                                VkDescriptorUpdateTemplateKHR* _descriptor_update_template) const
+ {
+     int ret = 0;
+ 
+@@ -1228,7 +1406,7 @@ int PipelineCache::new_pipeline(VkShaderModule shader_module, const ShaderInfo&
+ 
+     ensure_vk_pipeline_cache(vkdev, d);
+ 
+-    ret = vkdev->create_pipeline(shader_module, pipeline_layout, specializations, subgroup_size, d->vk_pipeline_cache, &pipeline);
++    ret = vkdev->create_pipeline(shader_module, pipeline_layout, specializations, subgroup_size, d->vk_pipeline_cache, local_size_xyz, &pipeline);
+     if (ret != 0)
+         goto ERROR_PipelineCache;
+ 
+diff --git a/src/pipelinecache.h b/src/pipelinecache.h
+index 0edee228..faf3c6e2 100644
+--- a/src/pipelinecache.h
++++ b/src/pipelinecache.h
+@@ -66,12 +66,19 @@ protected:
+     int create_shader_module(int shader_type_index, const Option& opt,
+                              uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z,
+                              VkShaderModule* _shader_module, ShaderInfo& si) const;
++    int create_shader_module(int shader_type_index, const Option& opt,
++                             uint32_t local_size_x, uint32_t local_size_y, uint32_t local_size_z,
++                             VkShaderModule* _shader_module, ShaderInfo& si, bool* explicit_local_size) const;
+ 
+     int new_pipeline(VkShaderModule shader_module, const ShaderInfo& shader_info, const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size,
+                      VkDescriptorSetLayout* descriptorset_layout,
+                      VkPipelineLayout* pipeline_layout,
+                      VkPipeline* pipeline,
+                      VkDescriptorUpdateTemplateKHR* descriptor_update_template) const;
++    int new_pipeline(VkShaderModule shader_module, const ShaderInfo& shader_info, const std::vector<vk_specialization_type>& specializations, uint32_t subgroup_size,
++                     const uint32_t* local_size_xyz, VkDescriptorSetLayout* descriptorset_layout,
++                     VkPipelineLayout* pipeline_layout, VkPipeline* pipeline,
++                     VkDescriptorUpdateTemplateKHR* descriptor_update_template) const;
+ 
+ protected:
+     const VulkanDevice* vkdev;
+diff --git a/src/vulkan_header_fix.h b/src/vulkan_header_fix.h
+index 9bf885d0..39ab5162 100644
+--- a/src/vulkan_header_fix.h
++++ b/src/vulkan_header_fix.h
+@@ -8,6 +8,55 @@
+ 
+ // This header contains new structure and function declearation to fix build with old vulkan sdk
+ 
++// Meguviz: exact Vulkan registry declarations, also needed by SIMPLEVK.
++#ifndef VK_QUEUE_FAMILY_FOREIGN_EXT
++#define VK_QUEUE_FAMILY_FOREIGN_EXT (~2U)
++#endif
++#ifndef VK_KHR_external_semaphore_capabilities
++#define VK_KHR_external_semaphore_capabilities 1
++#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO_KHR (VkStructureType)1000076000
++#define VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES_KHR (VkStructureType)1000076001
++typedef enum VkExternalSemaphoreHandleTypeFlagBits {
++    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT = 0x00000010,
++    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FLAG_BITS_MAX_ENUM = 0x7fffffff
++} VkExternalSemaphoreHandleTypeFlagBits;
++typedef VkFlags VkExternalSemaphoreHandleTypeFlags;
++typedef VkFlags VkExternalSemaphoreFeatureFlags;
++#define VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT 0x00000001
++#define VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT 0x00000002
++typedef struct VkPhysicalDeviceExternalSemaphoreInfoKHR {
++    VkStructureType sType; const void* pNext; VkExternalSemaphoreHandleTypeFlagBits handleType;
++} VkPhysicalDeviceExternalSemaphoreInfoKHR;
++typedef struct VkExternalSemaphorePropertiesKHR {
++    VkStructureType sType; void* pNext; VkExternalSemaphoreHandleTypeFlags exportFromImportedHandleTypes;
++    VkExternalSemaphoreHandleTypeFlags compatibleHandleTypes; VkExternalSemaphoreFeatureFlags externalSemaphoreFeatures;
++} VkExternalSemaphorePropertiesKHR;
++typedef void(VKAPI_PTR* PFN_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR)(VkPhysicalDevice, const VkPhysicalDeviceExternalSemaphoreInfoKHR*, VkExternalSemaphorePropertiesKHR*);
++#endif
++#ifndef VK_KHR_external_semaphore
++#define VK_KHR_external_semaphore 1
++#define VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO (VkStructureType)1000077000
++typedef struct VkExportSemaphoreCreateInfo {
++    VkStructureType sType; const void* pNext; VkExternalSemaphoreHandleTypeFlags handleTypes;
++} VkExportSemaphoreCreateInfo;
++#endif
++#ifndef VK_KHR_external_semaphore_fd
++#define VK_KHR_external_semaphore_fd 1
++#define VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR (VkStructureType)1000079000
++#define VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR (VkStructureType)1000079001
++typedef VkFlags VkSemaphoreImportFlags;
++#define VK_SEMAPHORE_IMPORT_TEMPORARY_BIT 0x00000001
++typedef struct VkImportSemaphoreFdInfoKHR {
++    VkStructureType sType; const void* pNext; VkSemaphore semaphore; VkSemaphoreImportFlags flags;
++    VkExternalSemaphoreHandleTypeFlagBits handleType; int fd;
++} VkImportSemaphoreFdInfoKHR;
++typedef struct VkSemaphoreGetFdInfoKHR {
++    VkStructureType sType; const void* pNext; VkSemaphore semaphore; VkExternalSemaphoreHandleTypeFlagBits handleType;
++} VkSemaphoreGetFdInfoKHR;
++typedef VkResult(VKAPI_PTR* PFN_vkImportSemaphoreFdKHR)(VkDevice, const VkImportSemaphoreFdInfoKHR*);
++typedef VkResult(VKAPI_PTR* PFN_vkGetSemaphoreFdKHR)(VkDevice, const VkSemaphoreGetFdInfoKHR*, int*);
++#endif
++
+ #ifndef VK_KHR_maintenance1
+ #define VK_KHR_maintenance1 1
+ typedef VkFlags VkCommandPoolTrimFlags;

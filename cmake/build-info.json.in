@@ -2,9 +2,13 @@
   "schema_version": 1,
   "version": "@PROJECT_VERSION@",
   "build_fingerprint": "@MGC_BUILD_FINGERPRINT@",
+  "private_sdk_revision": "@MGC_PRIVATE_SDK_REVISION@",
   "private_sdk_fingerprint": "@MGC_PRIVATE_FINGERPRINT@",
   "ncnn_commit": "@MGC_NCNN_COMMIT@",
   "glslang_commit": "@MGC_GLSLANG_COMMIT@",
+  "android_static_openmp": "@MGC_ANDROID_STATIC_OPENMP@",
+  "android_openmp_runtime_sha256": "@MGC_OPENMP_RUNTIME_SHA256@",
+  "android_openmp_notice_sha256": "@MGC_OPENMP_NOTICE_SHA256@",
   "build_options": "@MGC_BUILD_OPTIONS@",
   "runtime_compiler_policy": "retained in Vulkan builds; no-runtime profile unsupported",
   "device_qualification": "NOT_RUN"

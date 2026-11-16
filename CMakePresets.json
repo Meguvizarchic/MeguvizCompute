@@ -23,7 +23,7 @@
         "CMAKE_BUILD_TYPE": "Release",
         "MGC_WITH_NCNN": "ON",
         "MGC_VULKAN": "OFF",
-        "MGC_NCNN_SOURCE": "${sourceDir}/../dependencies/ncnn",
+        "MGC_NCNN_SOURCE": "${sourceDir}/../dependencies/ncnn-meguviz",
         "NCNN_AVX": "OFF",
         "NCNN_AVX2": "OFF",
         "NCNN_AVX512": "OFF",
@@ -45,7 +45,7 @@
         "ANDROID_STL": "c++_static",
         "MGC_WITH_NCNN": "ON",
         "MGC_VULKAN": "ON",
-        "MGC_NCNN_SOURCE": "${sourceDir}/../dependencies/ncnn",
+        "MGC_NCNN_SOURCE": "${sourceDir}/../dependencies/ncnn-meguviz",
         "MGC_GLSLANG_SOURCE": "${sourceDir}/../dependencies/glslang",
         "MGC_BUILD_TESTS": "ON"
       }

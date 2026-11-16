@@ -9,8 +9,26 @@
     "repository": "https://github.com/nihui/glslang",
     "commit": "780b6a209132dc74e99458f62ebe5fa7e57c41cf"
   },
-  "patches": [],
-  "private_sdk_revision": "0.1.0",
+  "patches": [
+    {
+      "path": "third_party/patches/0001-vulkan-retirement-sync-fd.patch",
+      "sha256": "575b6f158862629f7fe4de5cdccb2ee434d85b0f9d955270c57cc63738a2ab9d",
+      "base_commit": "7e36d25cb153092ba87a60530455c7376fedf452",
+      "scope": "Owned retirement, safe SPIR-V bounds, source-sized compilation and deferred Android YCbCr pipeline"
+    }
+  ],
+  "private_sdk_revision": "0.2.6",
+  "android_openmp": {
+    "runtime": "LLVM libomp.a, static",
+    "ndk_revision": "30.0.16248370",
+    "llvm_base_revision": "2d287f51eff2a5fbf84458a33f7fb2493cf67965",
+    "runtime_sha256": {
+      "arm64-v8a": "2081add3cb6724b08a26de541bed6b15cd74e218a4b5099529e0387011a72385",
+      "armeabi-v7a": "fd477711c591eed3001de69c7c194b9de83a600fc1bd0a2c22476430b9e3931c"
+    },
+    "notice_sha256": "f96f763beb66a7ba7a667647fc64c0226ace875e590c831fdd9579ec1c1d91e1",
+    "license": "Apache-2.0 WITH LLVM-exception; see bundled LLVM notice for legacy terms"
+  },
   "runtime_compiler": "retained for Vulkan",
   "models_in_package": false
 }
