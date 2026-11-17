@@ -1,21 +1,80 @@
-<p><img src="docs/brand/MeguvizCompute.svg" width="96" alt="MeguvizCompute 图标"></p>
+<div align="center">
+
+<img src="docs/brand/MeguvizCompute.svg" width="96" height="96" alt="MeguvizCompute">
 
 # MeguvizCompute
 
-当前候选已实际实现 Vulkan buffer、ncnn 小图与通用 GPU 核、RGBA8 AHB 互操作、最终提交异步退役和运行时 shaderpack。代码已冻结交协调者统一验证；`STATUS.json` 标记 implemented-unverified。仅完成必要 Android arm64 功能对象编译，不代表真机资格或性能成绩。
+**Vulkan / ncnn 通用 GPU 计算 SDK**
 
-公开头位于 `include/meguviz`。`usage=0` 是显式 CPU staging，`MGC_RESOURCE_GPU_BUFFER` 为真实 VkMat；GPU/AHB 不能 map。`mgc_lease_publish_read` 在完成写入后封存内容，所有引用转为只读。`mgc_android_import` 独立 acquire AHB/dup fd，内容 retain/release 回调直到最终引用结束，不能用对象 refcount 代替 producer 内容复用权限。
+C ABI · 资源租约 · AHB 互操作 · shaderpack
 
-私有 SDK 的 `with_ncnn_gpu` 仅允许同域作用域：callback 录制命令，外层统一提交、物理退役和 host finalize。view.buffer 是完整 allocation，shader 必须应用 info.byte_offset/byte_length。AHB view 为 typed RGBA8 storage image，逐资源检查格式能力；Compute 负责 GENERAL/FOREIGN ownership，外部消费者每次读完通过 set_acquire_fence 注册完成依赖。HOST_WAIT_COMPAT 与 binary GPU_SYNC_FD 分别实现，缺能力明确拒绝。
+<br>
 
-ncnn 原始 pin 保持 `7e36d25cb153092ba87a60530455c7376fedf452`，glslang 保持 `780b6a209132dc74e99458f62ebe5fa7e57c41cf`。构建消费独立 `../dependencies/ncnn-meguviz` fork，精确 patch 字节在 `third_party/patches` 和 `third_party/locks/ncnn.lock.json` 登记并进入私有 SDK fingerprint。共享 `../dependencies/ncnn` 未修改。fork 保留 recording hidden submit/wait 阈值，不能宣称 FULL_RECORD_ASYNC。
+[![License](https://img.shields.io/badge/license-MIT-00AEEC?style=flat-square&labelColor=2d3a55)](LICENSE)
+[![Language](https://img.shields.io/badge/lang-C%2B%2B-DEA584?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizCompute)
+[![Issues](https://img.shields.io/github/issues/Meguvizarchic/MeguvizCompute?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizCompute/issues)
 
-Compute 默认保持 OpenMP OFF；Android ARM ncnn 构建可显式设置 `MGC_ANDROID_STATIC_OPENMP=ON`，使用锁定的 NDK 静态 `libomp.a`。启用时实际 ABI 归档与 LLVM NOTICE 的 SHA-256 必须匹配锁并进入私有 SDK 指纹；安装包包含相应通知。运行库或通知身份改变时构建会拒绝，而不是沿用旧指纹。
+[已实现](#已实现) · [未实现与未取得的证据](#未实现与未取得的证据) · [构建与验证](#构建与验证) · [证据与回退](#证据与回退)
 
-GPU kernels 支持 copy、有限 FP32 ReLU/normalize/statistics 与半像素 RGB8 resize。统计回读有界分块小摘要，GPU sum 使用 FP32 缩放补偿归约，设备数值容差需最终 oracle 验证；不把它伪装成 CPU double 累加的逐位相等。公开 GPU buffer 子区间须满足设备 storage offset 对齐；私有完整 allocation view 支持 shader 显式 offset。shaderpack open/select 可独立在 host 验证，ncnn pipeline 缓存与 native-vulkan artifact view 分开；runtime glslang 保留。
+</div>
 
-独立消费者：`mgc_vulkan_chain`（无设备返回77）、`mgc_shaderpack_consumer pack-root variant-key effective-options-hash`、既有 public C/private graph/tensor_statistics。可重复构建命令为 CMake presets `windows-reference`、`windows-cpu`、`android-arm64-api27`、`android-v7-api27`。最终 build/install/运行由协调者统一执行，原证据与失败日志均保留在 `build/reports`。
+---
 
-SDK 是 STATIC/PIC development package；正式单 DSO 组装由 Media distribution 负责。不含研究模型、生产权重或自动下载器；未外部发布、未推送。设备缺失只延后资格，不代表以上代码未实施。
+<details>
+<summary><b>目录</b></summary>
 
-C4 候选支持 Vulkan 1.0/1.1/1.3 与 SPIR-V 1.0/1.3/1.6，实际放行依赖 vkCreateDevice 已启用快照：FP16/int8/int16 storage 与 arithmetic、subgroup、BF16/cooperative/dot、浮点控制、原子作用域、工作组/共享内存/描述符/图像格式分别检查。新 artifact 保存完整 effective_options、target_facts 与 facts hash，并在执行时和真实 typed Option、actual domain 比较；旧包仍可 host inspect，缺执行绑定时不会创建 GPU pipeline。来源 schema 由 ShaderTools 唯一拥有并进入工具实现 fingerprint，runtime compiler 保留。
+- [已实现](#已实现)
+- [未实现与未取得的证据](#未实现与未取得的证据)
+- [构建与验证](#构建与验证)
+- [证据与回退](#证据与回退)
+
+</details>
+
+---
+
+当前是可运行的 **0.1.0 开发 SDK**。Windows 与 Android 模拟器上的 CPU 公共契约、真实 ncnn CPU 小图已验证；ARM64/ARMv7 的 ncnn Vulkan 静态依赖闭包已交叉构建并从安装目录独立链接。`bil-rife-ncnn-android` 的完整 C1–C6 资格尚未完成，不能称为 GPU/AHB 插帧引擎发布候选。逐 gate 状态与实际证据见 [STATUS.json](STATUS.json)。
+
+## 已实现
+
+- 版本化纯 C ABI；runtime/domain、资源身份与代际、内容 lease、显式 map/unmap。
+- 有界任务 worker、提交引用转移、拒绝保留、取消与物理退役分离、最终 callback 一次、超时后继续 drain、消费者输出跨 session 保活。
+- CPU copy、半像素 bilinear RGB8 resize、有限浮点 min-max normalization、statistics，以及通过真实 ncnn Input/ReLU 图执行的 `RELU_F32`。
+- 私有 `backend_ncnn_sdk`：固定 ncnn 版本、serial execution slot、受 domain 保活的 ncnn device scope、可供其他算法提交的 host job。CPU domain 的 device 是 null；Vulkan domain 由 ncnn 实际创建。
+- STATIC/PIC development packages、安装后的公共 C 与私有 custom-op consumers、配置期 fingerprint 与重复 ncnn owner 拒绝。
+- 通用 affine shader 的离线编译与独立 host 静态校验。它尚未接入运行时 pipeline。
+
+## 未实现与未取得的证据
+
+`mgc_android_import` 与 native release-fence export 目前明确返回 `UNSUPPORTED_CAPABILITY`。AHB 资源适配、跨 API layout/ownership barrier、GPU 通用核同图链路、sync_fd 创建补丁、异步 ncnn 提交拆分、运行时 shaderpack/pipeline/cache 接入尚未完成。真实 GPU、hidden-submit trace、多设备、长期热负载、能量、音画与呈现证据均未取得。模拟器 CPU 结果不替代这些门槛。runtime glslang 在 Vulkan 组合中保留。
+
+## 构建与验证
+
+依赖源码位于授权的 `../dependencies/ncnn`，固定 commit `7e36d25cb153092ba87a60530455c7376fedf452`；其 glslang 子模块固定 `780b6a209132dc74e99458f62ebe5fa7e57c41cf`。`tools/verify_upstream_patches.py` 拒绝版本漂移或未登记 patch。SDK 不含 RIFE 模型、第三方转换权重、下载器或测试 DSO。
+
+当前机器的可重复命令（Python 3.12.14；MSVC 19.51；NDK r30）：
+
+```powershell
+& 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' tools/verify_development_sdk.py
+& 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' tools/verify_android_sdk.py --abi arm64
+& 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' tools/verify_android_sdk.py --abi v7
+& 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' tools/run_android_cpu.py --serial emulator-5732
+```
+
+最后一条只适用于已核实、无并行 instrumentation 冲突的当前模拟器；仅写 `/data/local/tmp/meguviz-01a1814c` 下自有测试。设备已变更时先重新核实，不启动或连接未知设备。
+
+安装目录为 `build/install/windows-cpu`、`build/install/android-arm64-api27` 与 `build/install/android-v7-api27`。Android 外部消费者同时设置 `CMAKE_FIND_ROOT_PATH` 与 `CMAKE_PREFIX_PATH` 指向目标 SDK；`MGC_REQUIRED_PRIVATE_SDK_FINGERPRINT` 必须匹配对应 ABI 的 `build-info.json`。Windows/Linux/各 Android ABI 的 private fingerprint 彼此不同，运行时 ncnn Options 不属于编译身份。
+
+```cmake
+find_package(MeguvizCompute 0.1 CONFIG REQUIRED)
+target_link_libraries(application PRIVATE MeguvizCompute::core)
+# 只有内部算法适配器才使用：
+target_link_libraries(algorithm PRIVATE MeguvizCompute::backend_ncnn_sdk)
+```
+
+先由 Compute 提供唯一 ncnn owner；提前自行创建另一 ncnn target 会在配置期失败。官方最终单 DSO 的组合、符号白名单和 JNI owner 归 Media distribution。
+
+## 证据与回退
+
+`artifacts/` 保存源码清单、已安装 SDK 的逐文件身份与真实测试摘要；完整 commands、stdout/stderr、CTest XML 和测试二进制保留在摘要指向的 `build/reports/`。开发 DSO 的 ELF 对齐通过只说明静态格式，尚无 16KB 环境运行证据。
+
+基线保守配置是 `MGC_WITH_NCNN=OFF` 的 CPU reference；`MGC_VULKAN=OFF` 的 ncnn CPU 可独立消费。未 qualified 的 Android 加速路径 fail-closed，宿主应保留其原 legacy/原画回退。不要卸载在途代码或覆盖已装载 DSO。
