@@ -50,7 +50,7 @@ struct OwnedGpuBatch {
                 std::lock_guard<std::mutex> lock(resource->mutex);
 #if defined(__ANDROID__)
                 if(resource->ownership_uncertain||resource->external_transition||resource->external_access_state==1||resource->external_access_state==2||
-                    (resource->external_access_state==3&&resource->external_access_lease!=lease))return MGC_BUSY;
+                    (!meguviz_compute_detail::same_producer_content(resource->external_access_state, lease->desc.content_id, resource->current_content)))return MGC_BUSY;
 #endif
                 if(resource->maps||(resource->in_flight&&!ticket_owns(lease)&&std::find(idle.begin(),idle.end(),resource)==idle.end()))return MGC_BUSY;
                 if(!resource->in_flight){++resource->in_flight;idle.push_back(resource);}
@@ -249,6 +249,82 @@ struct OwnedGpuBatch {
     }
     MgcStatus service(bool initial=false) {
         wait_budget=initial?100000000:0;
+#if defined(__ANDROID__)
+        // Check requested AHB leases before entering any GPU owner/device slot.
+        // Private jobs may request leases not listed in their ticket, so the
+        // session-level producer check alone is insufficient.
+        auto invalidate_requested = [&](MgcStatus cause) {
+            for (auto *output : requested) if (output) {
+                std::lock_guard<std::mutex> lock(output->resource->mutex);
+                if (output->desc.access == MGC_ACCESS_WRITE) {
+                    output->resource->content_invalid = true;
+                    output->resource->content_failure = cause;
+                }
+            }
+        };
+        if (stage == PREPARE || stage == ACQUIRE) for (auto *lease : requested) {
+            if (!lease || !lease->resource->ahb) continue;
+#if MGC_HAVE_PRODUCER_WAKE
+            bool guarded_content = false;
+            {
+                std::unique_lock<std::mutex> lock(lease->resource->mutex, std::try_to_lock);
+                if (!lock.owns_lock()) return MGC_BUSY;
+                guarded_content = resource_guarded_content_locked(lease->resource);
+                register_producer_waiter_locked(lease->resource, producer_wake_alias(ticket->session_identity));
+            }
+            if (guarded_content) {
+                if (!meguviz_compute_detail::guarded_private_lease_allowed(true,
+                    std::find(ticket->leases.begin(), ticket->leases.end(), lease) != ticket->leases.end())) {
+                    // A private batch may not introduce a guarded input after
+                    // acceptance: prior outputs might already be public.
+                    invalidate_requested(MGC_UNSUPPORTED_CAPABILITY);
+                    fail(MGC_UNSUPPORTED_CAPABILITY); stage = CLEANUP; break;
+                }
+                // Resource->ticket lock nesting would invert the publication
+                // path. Latch only after dropping the resource lock.
+                std::lock_guard<std::mutex> lock(ticket->mutex);
+                ticket->guarded_submission.store(true);
+                if (ticket->cancelled.load() && ticket->guarded_write_published) {
+                    fail(MGC_CANCELLED); stage = CLEANUP; break;
+                }
+            }
+            if (ticket->guarded_submission.load() && ticket->cancelled.load()) {
+                invalidate_requested(MGC_CANCELLED); fail(MGC_CANCELLED); stage = CLEANUP; break;
+            }
+#endif
+            const auto ready = wait_ready(lease, 0);
+            if (ready == MGC_BUSY || ready == MGC_TIMEOUT) {
+                // Yielding must not leave the waiter registered: the requested
+                // lease is not counted in the resource's in-flight leases, so
+                // a stale slot could displace another session's waiter.
+#if MGC_HAVE_PRODUCER_WAKE
+                std::lock_guard<std::mutex> lock(lease->resource->mutex);
+                unregister_producer_waiter_locked(lease->resource, producer_wake_alias(ticket->session_identity));
+#endif
+                return MGC_BUSY;
+            }
+            if (ready != MGC_SUCCESS) {
+                // Private requested leases may not appear in ticket->leases.
+                // Failed dependency admission must invalidate every output
+                // of this batch even though no GPU command was recorded.
+                invalidate_requested(ready);
+                fail(ready); stage = CLEANUP; break;
+            }
+        }
+#if MGC_HAVE_PRODUCER_WAKE
+        if (ticket->guarded_submission.load() && (stage == PREPARE || stage == ACQUIRE)) {
+            bool unlisted_write = false;
+            for (auto *output : requested) if (output) {
+                std::lock_guard<std::mutex> lock(output->resource->mutex);
+                if (output->desc.access == MGC_ACCESS_WRITE &&
+                    !meguviz_compute_detail::guarded_private_lease_allowed(true,
+                        std::find(ticket->leases.begin(), ticket->leases.end(), output) != ticket->leases.end()))
+                    unlisted_write = true;
+            }
+            if (unlisted_write) { invalidate_requested(MGC_UNSUPPORTED_CAPABILITY); fail(MGC_UNSUPPORTED_CAPABILITY); stage = CLEANUP; }
+        }
+#endif
+#endif
         auto* previous=active_ticket;active_ticket=ticket;
         struct ResetTicket { MgcTicket* previous; ~ResetTicket(){active_ticket=previous;} } reset_ticket{previous};
         auto status=stage==DONE&&cleaned?MGC_SUCCESS:
@@ -262,6 +338,12 @@ struct OwnedGpuBatch {
         if(owner)return status==MGC_SUCCESS?MGC_BUSY:status;
         // No device/owner scope is held here. Dropping borrowed content refs
         // may call producer code, so do it only after serialized GPU cleanup.
+#if MGC_HAVE_PRODUCER_WAKE && defined(__ANDROID__)
+        for (auto *lease : requested) if (lease && lease->resource->ahb) {
+            std::lock_guard<std::mutex> lock(lease->resource->mutex);
+            unregister_producer_waiter_locked(lease->resource, producer_wake_alias(ticket->session_identity));
+        }
+#endif
         for(auto* lease:detached)mgc_lease_release(lease);detached.clear();
         for(auto* lease:pinned)mgc_lease_release(lease);pinned.clear();
         keepalive.reset();

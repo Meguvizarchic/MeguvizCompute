@@ -25,7 +25,8 @@ enum {
     MGC_MODEL_MISMATCH = -5, MGC_ARTIFACT_MISMATCH = -6,
     MGC_BUSY = -7, MGC_BACKPRESSURE = -8, MGC_DEADLINE_REJECTED = -9,
     MGC_OUT_OF_MEMORY = -10, MGC_DEVICE_LOST = -11, MGC_TIMEOUT = -12,
-    MGC_CANCELLED = -13, MGC_INTERNAL_ERROR = -14
+    MGC_CANCELLED = -13, MGC_INTERNAL_ERROR = -14,
+    MGC_PRODUCER_FAILED = -15
 };
 
 typedef struct MgcHeader {
@@ -56,7 +57,8 @@ enum {
     MGC_CAP_HOST_JOB_ASYNC = 11, MGC_CAP_FINAL_SUBMIT_ASYNC = 12,
     MGC_CAP_FULL_RECORD_ASYNC = 13, MGC_CAP_GPU_TIMESTAMP = 14,
     MGC_CAP_FP16_STORAGE = 15, MGC_CAP_FP16_ARITHMETIC = 16,
-    MGC_CAP_APPROVED_SHADER_PROFILE = 17
+    MGC_CAP_APPROVED_SHADER_PROFILE = 17, MGC_CAP_EXTERNAL_HOST_MEMORY = 18,
+    MGC_CAP_GUARDED_PRODUCER_FENCE = 19
 };
 enum { MGC_ACCESS_READ = 1, MGC_ACCESS_WRITE = 2 };
 /* usage=0 is explicit host storage. GPU allocations are never CPU mapped. */
@@ -108,6 +110,23 @@ typedef struct MgcResourceDesc {
     uint32_t required_flags;
     uint32_t reserved[3];
 } MgcResourceDesc;
+
+/* Optional externally owned CPU backing. The caller keeps its reference until
+ * this call returns. Compute retains context once on admission and releases it
+ * after the final resource/lease/task reference. The callback functions must
+ * be thread-safe, no-throw and safe to call outside Compute locks. Data must
+ * remain stable for that lifetime. READ forbids creation of WRITE leases. */
+typedef struct MgcHostMemoryDesc {
+    MgcHeader header;
+    void *data;
+    uint64_t capacity_bytes;
+    uint32_t access;
+    uint32_t required_flags;
+    uint32_t reserved[4];
+    void *context;
+    MgcContextFn retain;
+    MgcContextFn release;
+} MgcHostMemoryDesc;
 
 typedef struct MgcLeaseDesc {
     MgcHeader header;
@@ -220,7 +239,10 @@ typedef struct MgcSessionDesc {
  * Accepted context is retained before submit returns; release occurs after the
  * final callback returns. Completion runs on the session worker, never inline
  * in submit and never under its lock. The callback may query/cancel or submit;
- * drain/close from that same callback returns BUSY. */
+ * drain/close from that same callback returns BUSY. In an experimental guarded
+ * producer build the worker executes the first ready ticket, so completion
+ * order is readiness order rather than submission order; tickets that share a
+ * resource are still serialized by acceptance. */
 typedef struct MgcSubmitDesc {
     MgcHeader header;
     uint64_t request_id;
@@ -296,6 +318,8 @@ MGC_API void mgc_domain_retain(MgcDomain *domain);
 MGC_API void mgc_domain_release(MgcDomain *domain);
 MGC_API MgcStatus mgc_domain_capability(MgcDomain *domain, uint32_t feature, MgcCapability *capability);
 MGC_API MgcStatus mgc_resource_create(MgcDomain *domain, const MgcResourceDesc *desc, MgcResource **resource);
+MGC_API MgcStatus mgc_resource_import_host_v1(MgcDomain *domain, const MgcResourceDesc *desc,
+    const MgcHostMemoryDesc *backing, MgcResource **resource);
 MGC_API void mgc_resource_retain(MgcResource *resource);
 MGC_API void mgc_resource_release(MgcResource *resource);
 MGC_API MgcStatus mgc_lease_create(MgcResource *resource, const MgcLeaseDesc *desc, MgcLease **lease);
@@ -320,8 +344,11 @@ MGC_API MgcStatus mgc_session_close(MgcSession *session);
 MGC_API MgcStatus mgc_submit(MgcSession *session, const MgcSubmitDesc *desc, MgcTicket **ticket);
 MGC_API void mgc_ticket_retain(MgcTicket *ticket);
 MGC_API void mgc_ticket_release(MgcTicket *ticket);
-/* Cancellation requested before completion discards the result. If execution
- * reports MGC_DEVICE_LOST, completion reports that failure even when cancelled. */
+/* Cancellation requested before completion discards the result. A confirmed
+ * MGC_DEVICE_LOST or MGC_PRODUCER_FAILED remains the completion status even
+ * when cancellation is concurrent. For an experimental guarded producer job,
+ * once a private retired-WRITE release has transferred an output, cancellation
+ * before completion returns MGC_BUSY: that output cannot be retracted. */
 MGC_API MgcStatus mgc_ticket_cancel(MgcTicket *ticket);
 MGC_API MgcStatus mgc_ticket_query(MgcTicket *ticket, MgcCompletion *completion);
 MGC_API MgcStatus mgc_ticket_execution_info(MgcTicket *ticket, MgcExecutionInfo *info);

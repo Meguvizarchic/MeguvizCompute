@@ -5,8 +5,11 @@
         if (!lease || !out) return MGC_INVALID_ARGUMENT;
         *out = nullptr;
         auto *r = lease->resource;
+#if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__)
+        reap_external_ready(r);
+#endif
         std::lock_guard<std::mutex> lock(r->mutex);
-        if(r->content_invalid)return MGC_DEVICE_LOST;
+        if(r->content_invalid)return r->content_failure;
 #if MGC_HAVE_NCNN && NCNN_VULKAN
         if(r->desc.usage&&domain_is_lost(r->domain))return MGC_DEVICE_LOST;
 #endif
@@ -105,6 +108,17 @@
                 (*out)->acquire_fd = dup(d.acquire_fence_fd);
                 if ((*out)->acquire_fd < 0)
                 { mgc_lease_release(*out); *out = nullptr; mgc_resource_release(owned); return MGC_INTERNAL_ERROR; }
+                const int content_fd = dup(d.acquire_fence_fd);
+                if (content_fd < 0)
+                { mgc_lease_release(*out); *out = nullptr; mgc_resource_release(owned); return MGC_INTERNAL_ERROR; }
+                {
+                    std::lock_guard<std::mutex> lock(owned->mutex);
+                    owned->external_access_fd = content_fd;
+                    owned->external_access_state = 3;
+                    ++owned->external_access_generation;
+                    owned->external_access_lease = *out;
+                    mgc_lease_retain(*out);
+                }
                 (*out)->desc.dependency_kind = d.sync_mode ? MGC_DEPENDENCY_SYNC_FD : MGC_DEPENDENCY_HOST_WAIT;
             }
             (*out)->sync_mode = d.sync_mode;
@@ -194,6 +208,61 @@
             }
         }
         if (pin) mgc_lease_release(pin);
+        return MGC_SUCCESS;
+#else
+        return MGC_UNSUPPORTED_CAPABILITY;
+#endif
+    }
+    MgcStatus mgc_android_set_guarded_producer_fence(MgcLease *lease, int32_t fd, uint64_t *generation)
+    {
+        if (generation) *generation = 0;
+        if (!lease || !generation || fd < -1) return MGC_INVALID_ARGUMENT;
+#if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__) && MGC_ENABLE_GUARDED_PRODUCER_FENCE
+        ScopedLeaseCall call(lease);
+        auto *r = lease->resource;
+        std::unique_lock<std::mutex> lock(r->mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return MGC_BUSY;
+        if (!r->ahb) return MGC_UNSUPPORTED_CAPABILITY;
+        if (lease->desc.access != MGC_ACCESS_WRITE) return MGC_INVALID_ARGUMENT;
+        if (r->in_flight || r->maps || r->ownership_uncertain || r->external_transition ||
+            r->external_access_state != 1 || r->external_access_lease != lease || !r->externally_owned)
+            return MGC_BUSY;
+        const int copy = fd < 0 ? -1 : dup(fd);
+        if (fd >= 0 && copy < 0) return MGC_INTERNAL_ERROR;
+        const int producer = fd < 0 ? -1 : dup(fd);
+        if (fd >= 0 && producer < 0) { close(copy); return MGC_INTERNAL_ERROR; }
+        r->external_access_fd = copy;
+        r->external_access_state = 3;
+        r->producer_guard = 1;
+        set_guarded_content_locked(r, true);
+        lease->acquire_fd = producer;
+        lease->desc.dependency_kind = lease->sync_mode ? MGC_DEPENDENCY_SYNC_FD : MGC_DEPENDENCY_HOST_WAIT;
+        *generation = r->external_access_generation;
+        return MGC_SUCCESS;
+#else
+        return MGC_UNSUPPORTED_CAPABILITY;
+#endif
+    }
+    MgcStatus mgc_android_finish_guarded_producer(MgcLease *lease, uint64_t generation, MgcStatus cleanup_status)
+    {
+        if (!lease || !generation || (cleanup_status != MGC_SUCCESS && cleanup_status != MGC_PRODUCER_FAILED))
+            return MGC_INVALID_ARGUMENT;
+#if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__) && MGC_ENABLE_GUARDED_PRODUCER_FENCE
+        ScopedLeaseCall call(lease);
+        auto *r = lease->resource;
+        ProducerWakeList wake{};
+        {
+            std::unique_lock<std::mutex> lock(r->mutex, std::try_to_lock);
+            if (!lock.owns_lock()) return MGC_BUSY;
+            if (!r->ahb) return MGC_UNSUPPORTED_CAPABILITY;
+            if (r->external_access_state != 3 || r->external_access_lease != lease) return MGC_INVALID_ARGUMENT;
+            const auto status = meguviz_compute_detail::finish_producer_guard(r->producer_guard,
+                r->external_access_generation, generation, cleanup_status, r->content_invalid, r->content_failure);
+            if (status != MGC_SUCCESS) return status;
+            wake = producer_waiters_locked(r);
+        }
+        notify_producer_waiters(wake);
+        reap_external_ready(r);
         return MGC_SUCCESS;
 #else
         return MGC_UNSUPPORTED_CAPABILITY;

@@ -48,8 +48,11 @@ MGC_API MgcStatus mgc_android_import(MgcDomain *domain, const MgcAndroidImportDe
  * content lease pins it until all consumers retire. No producer may rewrite a
  * content version merely because it retained the AHB object. */
 MGC_API MgcStatus mgc_android_allocate(MgcDomain *domain, const MgcAndroidAllocateDesc *desc, MgcLease **lease);
-/* Buffer is borrowed while lease remains held. Use AHardwareBuffer_acquire if
- * an independent object reference is needed; that does not grant content reuse. */
+/* Buffer is borrowed while lease remains held. An object reference alone does
+ * not prove content readiness or grant direct CPU/GPU access: external users
+ * must reserve access and honor its ready fence and any producer cleanup gate.
+ * Use AHardwareBuffer_acquire only for an independent object reference; it does
+ * not grant content reuse. */
 MGC_API MgcStatus mgc_android_get_buffer(MgcLease *lease, struct AHardwareBuffer **borrowed_buffer);
 MGC_API MgcStatus mgc_android_wait_ready(MgcLease *lease, uint64_t timeout_ns);
 /* Ends the same lease's outstanding external reservation. READ registers an
@@ -59,6 +62,21 @@ MGC_API MgcStatus mgc_android_wait_ready(MgcLease *lease, uint64_t timeout_ns);
  * it; a registered WRITE may feed the same published lease's GPU dependency.
  * Failed registration preserves the reservation. No last-fd replacement. */
 MGC_API MgcStatus mgc_android_set_acquire_fence(MgcLease *lease, int32_t borrowed_fd);
+/* Optional guarded producer handoff. A successful registration borrows the
+ * fence, returns the reservation generation and leaves an independent cleanup
+ * gate closed. Submissions may be accepted but cannot execute until BOTH the
+ * sync-file is verified successful and finish_guarded confirms host cleanup.
+ * The original lease and its owning code/context must survive until finish.
+ * A stale generation is rejected. On unknown cleanup do not finish: preserve
+ * the resource and reservation. This additive API is usable only when
+ * MGC_CAP_GUARDED_PRODUCER_FENCE reports enabled on the same domain. */
+MGC_API MgcStatus mgc_android_set_guarded_producer_fence(MgcLease *lease, int32_t borrowed_fd,
+    uint64_t *generation);
+/* cleanup_status MGC_SUCCESS confirms successful cleanup. MGC_PRODUCER_FAILED
+ * reports failed or uncertain cleanup to queued consumers, while retaining
+ * the producer reservation and pin: it is not proof of physical retirement. */
+MGC_API MgcStatus mgc_android_finish_guarded_producer(MgcLease *lease, uint64_t generation,
+    MgcStatus cleanup_status);
 /* Begins one bounded external access and retains the content lease. Success
  * transfers a ready fd and GENERAL/FOREIGN ownership. Every success must end
  * with set_acquire_fence on the same lease, even when no GL work was issued.

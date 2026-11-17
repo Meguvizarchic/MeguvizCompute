@@ -341,11 +341,17 @@ MgcStatus image_ownership(MgcLease* lease,bool acquire,bool own_transition) {
     if(!lease->resource->ahb)return MGC_SUCCESS;
     const auto serviced=service_standalone_image(lease,acquire);if(serviced)return serviced;
     if(domain_is_lost(lease->resource->domain))return MGC_DEVICE_LOST;
+    if (acquire) {
+        // Probe before creating an owner or entering the device slot.
+        const auto ready = wait_ready(lease, 0);
+        if (ready == MGC_TIMEOUT || ready == MGC_BUSY) return MGC_BUSY;
+        if (ready != MGC_SUCCESS) return ready;
+    }
     {
         auto* resource=lease->resource;
         std::lock_guard<std::mutex> lock(resource->mutex);
         if(resource->ownership_uncertain||(resource->external_transition&&!own_transition)||resource->external_access_state==1||
-            resource->external_access_state==2||(resource->external_access_state==3&&(!acquire||resource->external_access_lease!=lease)))return MGC_BUSY;
+            resource->external_access_state==2||(resource->external_access_state==3&&(!acquire||!meguviz_compute_detail::same_producer_content(resource->external_access_state, lease->desc.content_id, resource->current_content))))return MGC_BUSY;
         if(acquire!=resource->externally_owned)return MGC_SUCCESS;
     }
     try{return standalone_gpu_detail::start(lease->resource->domain,lease,acquire,own_transition,false);}

@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include "producer_guard.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -34,14 +35,22 @@
 #if defined(__ANDROID__)
 #include <android/hardware_buffer.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include <cerrno>
 #include "fence_wait.hpp"
+#include "sync_file_wait.hpp"
 #endif
 #if MGC_HAVE_NCNN
 #include <datareader.h>
 #include <layer.h>
 #include <meguviz/backend_ncnn_sdk.hpp>
+#endif
+#ifndef MGC_ENABLE_GUARDED_PRODUCER_FENCE
+#define MGC_ENABLE_GUARDED_PRODUCER_FENCE 0
+#endif
+#if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__) && MGC_ENABLE_GUARDED_PRODUCER_FENCE
+struct ProducerWake;
 #endif
 #include "gpu_storage.hpp"
 #include "code_image_lease.hpp"
@@ -207,16 +216,69 @@ struct MgcDomain
 #endif
 #endif
 };
+#if (MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__) && MGC_ENABLE_GUARDED_PRODUCER_FENCE) || defined(MGC_TEST_GUARDED_HOST)
+// A weak per-resource reference avoids retaining a session across teardown.
+// The Android guarded build waits on an eventfd: a notify is a counter
+// increment, so a signal racing with poll() cannot be lost and no mutex or
+// condition variable is needed. The host test build keeps the epoch pair
+// because it has no sync-file descriptor to poll.
+#if defined(__ANDROID__) && MGC_ENABLE_GUARDED_PRODUCER_FENCE
+#define MGC_PRODUCER_WAKE_FD 1
+struct ProducerWake {
+    int fd = -1;
+    void notify() noexcept {
+        if (fd < 0) return;
+        uint64_t one = 1;
+        // A saturated counter stays readable, so EAGAIN needs no retry.
+        (void)::write(fd, &one, sizeof(one));
+    }
+};
+#else
+#define MGC_PRODUCER_WAKE_FD 0
+struct ProducerWake {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::atomic<uint64_t> epoch{0};
+    void notify() noexcept {
+        // Predicate mutation must share the wait mutex, otherwise a notify
+        // between predicate evaluation and wait could be lost.
+        try { std::lock_guard<std::mutex> lock(mutex); epoch.fetch_add(1, std::memory_order_release); }
+        catch (...) { /* The bounded polling backstop remains available. */ }
+        changed.notify_all();
+    }
+};
+#endif
+#define MGC_HAVE_PRODUCER_WAKE 1
+#else
+#define MGC_HAVE_PRODUCER_WAKE 0
+#endif
 struct MgcResource
 {
     std::atomic<uint32_t> refs{1};
     MgcDomain *domain = nullptr;
     MgcResourceDesc desc{};
     std::vector<unsigned char> data;
+    unsigned char *external_data = nullptr;
+    uint32_t external_access = 0;
+    void *external_context = nullptr;
+    MgcContextFn external_release = nullptr;
+    unsigned char *host_data() noexcept { return external_data ? external_data : data.data(); }
     std::mutex mutex;
     uint32_t readers = 0, writers = 0, maps = 0, in_flight = 0;
     uint64_t current_content = 0;
     bool content_invalid = false;
+    MgcStatus content_failure = MGC_DEVICE_LOST;
+#if defined(MGC_TEST_GUARDED_HOST)
+    // Host-only synthetic AHB state; Android stores it in AhbAllocator.
+    std::array<std::weak_ptr<ProducerWake>, 2> producer_waiters;
+    bool guarded_content = false;
+#endif
+#if defined(MGC_TEST_GUARDED_HOST)
+    uint8_t test_guard = 0;
+    uint64_t test_generation = 0;
+    MgcStatus test_fence_status = MGC_SUCCESS;
+    MgcLease *test_producer_pin = nullptr;
+#endif
     uint64_t accounted_bytes = 0;
     uint64_t budget_bytes = 0;
     bool imported_allocation = false;
@@ -236,6 +298,9 @@ struct MgcResource
     uint64_t external_access_generation = 0;
     MgcLease *external_access_lease = nullptr;
     int external_access_fd = -1;
+    // 0: ordinary access; 1: guarded producer cleanup pending;
+    // 2: guarded producer cleanup confirmed; 3: cleanup failed/uncertain.
+    uint8_t producer_guard = 0;
     bool external_transition = false;
     bool ownership_uncertain = false;
 #endif
@@ -254,15 +319,42 @@ struct MgcLease
     void *content_context = nullptr;
     MgcContextFn release_content = nullptr;
 };
+#if defined(MGC_TEST_METADATA_SIZE)
+extern "C" {
+// Cross-compiled object-symbol sizes can be inspected without executing an
+// Android binary. These probes are absent from all normal production builds.
+unsigned char mgc_test_size_resource[sizeof(MgcResource)]{};
+#if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__)
+unsigned char mgc_test_size_ahb_allocator[sizeof(AhbAllocator)]{};
+#endif
+}
+#endif
 // Tickets can outlive their session. Keep a separate identity alive so a new
 // session at the same address cannot acquire an old ticket's cancellation right.
-struct SessionIdentity {};
+struct SessionIdentity {
+#if MGC_HAVE_PRODUCER_WAKE
+    // Mutable because existing tickets intentionally hold a const identity.
+    // The wake shares this already-allocated identity's control block. The
+    // eventfd is owned here rather than by ProducerWake so the aliasing
+    // shared_ptr used by resources never closes it early; tickets may notify
+    // after the session itself is gone.
+    mutable ProducerWake wake;
+#if MGC_PRODUCER_WAKE_FD
+    SessionIdentity() { wake.fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); }
+    ~SessionIdentity() { if (wake.fd >= 0) ::close(wake.fd); }
+#endif
+#endif
+};
 struct MgcTicket
 {
     std::shared_ptr<const SessionIdentity> session_identity;
     MgcDomain *domain = nullptr;
     std::atomic<uint32_t> refs{1};
     std::atomic<bool> cancelled{false};
+#if MGC_HAVE_PRODUCER_WAKE
+    std::atomic<bool> guarded_submission{false}; // may also be discovered by a private batch
+    bool guarded_write_published = false; // any private transfer; protected by ticket mutex
+#endif
     std::mutex mutex;
     MgcCompletion result{};
     bool done = false;
@@ -304,6 +396,84 @@ struct MgcSession
     bool closing = false;
     std::thread worker;
 };
+#if defined(MGC_TEST_METADATA_SIZE)
+extern "C" {
+unsigned char mgc_test_size_session[sizeof(MgcSession)]{};
+#if MGC_HAVE_PRODUCER_WAKE
+unsigned char mgc_test_size_producer_wake[sizeof(ProducerWake)]{};
+#endif
+}
+#endif
+#if MGC_HAVE_PRODUCER_WAKE
+std::shared_ptr<ProducerWake> producer_wake_alias(const std::shared_ptr<const SessionIdentity> &identity) noexcept
+{
+    return identity ? std::shared_ptr<ProducerWake>(identity, &identity->wake) : std::shared_ptr<ProducerWake>{};
+}
+constexpr size_t producer_waiter_capacity = 2;
+std::weak_ptr<ProducerWake> *producer_waiter_slots_locked(MgcResource *resource) noexcept
+{
+#if defined(MGC_TEST_GUARDED_HOST)
+    return resource->producer_waiters.data();
+#else
+    return resource->ahb_allocator ? resource->ahb_allocator->producer_waiters.data() : nullptr;
+#endif
+}
+bool resource_guarded_content_locked(MgcResource *resource) noexcept
+{
+#if defined(MGC_TEST_GUARDED_HOST)
+    return resource->guarded_content;
+#else
+    return resource->ahb_allocator && resource->ahb_allocator->guarded_content;
+#endif
+}
+void set_guarded_content_locked(MgcResource *resource, bool value) noexcept
+{
+#if defined(MGC_TEST_GUARDED_HOST)
+    resource->guarded_content = value;
+#else
+    if (resource->ahb_allocator) resource->ahb_allocator->guarded_content = value;
+#endif
+}
+void register_producer_waiter_locked(MgcResource *resource, const std::shared_ptr<ProducerWake> &wake) noexcept
+{
+    auto *slots = producer_waiter_slots_locked(resource);
+    if (!wake || !slots) return;
+    std::weak_ptr<ProducerWake> *empty = nullptr;
+    for (size_t i = 0; i < producer_waiter_capacity; ++i) {
+        auto &slot = slots[i];
+        auto existing = slot.lock();
+        if (existing == wake) return;
+        if (!existing && !empty) empty = &slot;
+    }
+    // Bounded capacity: a private batch may register a requested lease that
+    // accept() does not count in-flight. If more than two distinct waiters
+    // contend, the extras fall back to the bounded watchdog rather than
+    // growing per-AHB storage.
+    if (empty) *empty = wake;
+}
+void unregister_producer_waiter_locked(MgcResource *resource, const std::shared_ptr<ProducerWake> &wake) noexcept
+{
+    auto *slots = producer_waiter_slots_locked(resource);
+    if (!wake || !slots) return;
+    for (size_t i = 0; i < producer_waiter_capacity; ++i) {
+        auto &slot = slots[i];
+        auto existing = slot.lock();
+        if (!existing || existing == wake) slot.reset();
+    }
+}
+using ProducerWakeList = std::array<std::shared_ptr<ProducerWake>, producer_waiter_capacity>;
+ProducerWakeList producer_waiters_locked(MgcResource *resource) noexcept
+{
+    ProducerWakeList result{};
+    auto *slots = producer_waiter_slots_locked(resource);
+    if (slots) for (size_t i = 0; i < result.size(); ++i) result[i] = slots[i].lock();
+    return result;
+}
+void notify_producer_waiters(const ProducerWakeList &waiters) noexcept
+{
+    for (const auto &waiter : waiters) if (waiter) waiter->notify();
+}
+#endif
 #if MGC_HAVE_NCNN && NCNN_VULKAN
 namespace meguviz {
 struct NcnnDomainOwner {
@@ -669,8 +839,8 @@ MgcStatus run_operation(MgcTicket *t)
             return MGC_UNSUPPORTED_CAPABILITY;
     }
 #endif
-    const unsigned char *src = d.input->resource->data.data() + d.input->desc.byte_offset;
-    unsigned char *dst = d.output->resource->data.data() + d.output->desc.byte_offset;
+    const unsigned char *src = d.input->resource->host_data() + d.input->desc.byte_offset;
+    unsigned char *dst = d.output->resource->host_data() + d.output->desc.byte_offset;
     if (d.operation == MGC_OPERATION_COPY)
     {
         std::memcpy(dst, src, static_cast<size_t>(d.byte_count));
@@ -800,30 +970,244 @@ void release_submission(MgcTicket *t)
         mgc_lease_release(l);
     t->leases.clear();
 }
+#if defined(MGC_TEST_GUARDED_HOST)
+// Host-only injection exercises the real accept/worker lifecycle with a
+// synthetic producer fence. It does not model Android GPU or fd ownership.
+MgcStatus test_guard_probe(MgcLease *lease)
+{
+    auto *r = lease->resource;
+    std::lock_guard<std::mutex> lock(r->mutex);
+    if (r->content_invalid) return r->content_failure;
+    if (!r->test_guard) return MGC_SUCCESS;
+    if (r->test_fence_status == MGC_PRODUCER_FAILED) {
+        r->content_invalid = true; r->content_failure = MGC_PRODUCER_FAILED; r->test_guard = 3;
+        return MGC_PRODUCER_FAILED;
+    }
+    if (r->test_fence_status != MGC_SUCCESS) return r->test_fence_status;
+    return meguviz_compute_detail::producer_gate_status(r->test_guard, r->content_invalid, r->content_failure);
+}
+extern "C" void mgc_test_after_guard_ready(MgcTicket *ticket);
+#endif
+enum class ProducerGate { Ready, Waiting, Failed, Cancelled };
+struct ProducerGateResult {
+    ProducerGate gate = ProducerGate::Ready;
+    MgcStatus status = MGC_SUCCESS;
+    bool producer_gate_skipped = false;
+    bool inspectable = true; // at least one waiting dependency can be polled
+};
+// One non-blocking pass over a ticket's producer dependencies. A waiting
+// ticket contributes a duplicated fence descriptor so the worker can block on
+// the kernel fence instead of a timer. Resource locks are taken only inside
+// the probe helpers; the caller must not hold the session lock.
+ProducerGateResult probe_producer_gate(MgcTicket *t, std::vector<int> &poll_fds) noexcept
+{
+    ProducerGateResult result;
+    result.status = MGC_CANCELLED;
+#if (MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__)) || defined(MGC_TEST_GUARDED_HOST)
+    // Accepted work may wait in the session without taking the GPU owner or
+    // issuing any command. Every AHB dependency (including a sibling lease)
+    // must verify the producer and its host cleanup gate first.
+#if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__)
+    if (domain_is_lost(t->domain)) {
+        result.status = MGC_DEVICE_LOST;
+        result.gate = ProducerGate::Failed;
+        return result;
+    }
+#endif
+    if (t->cancelled.load()) {
+        for (auto *lease : t->leases) if (lease) {
+            std::lock_guard<std::mutex> lock(lease->resource->mutex);
+            // A previously confirmed producer failure outranks a concurrent
+            // cancellation; cancellation must not hide it.
+            if (lease->resource->content_invalid &&
+                lease->resource->content_failure == MGC_PRODUCER_FAILED)
+                result.status = MGC_PRODUCER_FAILED;
+#if defined(MGC_TEST_GUARDED_HOST)
+            if (lease->resource->test_guard) result.producer_gate_skipped = true;
+#else
+            if (lease->resource->ahb) result.producer_gate_skipped = true;
+#endif
+        }
+        result.gate = ProducerGate::Cancelled;
+        return result;
+    }
+    bool waiting = false;
+    for (auto *lease : t->leases) if (lease) {
+        MgcStatus dependency;
+#if defined(MGC_TEST_GUARDED_HOST)
+        dependency = test_guard_probe(lease);
+#else
+        if (!lease->resource->ahb) continue;
+        dependency = wait_ready(lease, 0);
+#endif
+        if (dependency == MGC_SUCCESS) continue;
+        if (dependency != MGC_BUSY && dependency != MGC_TIMEOUT) {
+            result.status = dependency;
+            result.gate = ProducerGate::Failed;
+            return result;
+        }
+        waiting = true;
+#if MGC_HAVE_PRODUCER_WAKE
+        const int fd = dup_producer_poll_fd(lease);
+        if (fd >= 0) poll_fds.push_back(fd);
+        else if (fd == -2) result.inspectable = false;
+#else
+        result.inspectable = false;
+#endif
+    }
+    if (waiting) {
+        result.gate = ProducerGate::Waiting;
+        return result;
+    }
+    result.status = MGC_SUCCESS;
+    result.gate = ProducerGate::Ready;
+#else
+    result.status = MGC_SUCCESS;
+    result.gate = ProducerGate::Ready;
+#endif
+    return result;
+}
+#if MGC_HAVE_PRODUCER_WAKE
+// Block until a producer dependency may have changed. External sync-file
+// signals wake through the duplicated descriptors; cleanup completion,
+// failure, cancellation and close wake through the session eventfd. A long
+// watchdog bounds the error paths that have neither an fd nor a notify
+// (device loss, an unverifiable fence) without reintroducing a 5 ms loop.
+void wait_producer_progress(MgcSession *s, const std::vector<int> &fds, bool needs_backstop,
+    uint64_t observed_epoch) noexcept
+{
+#if MGC_PRODUCER_WAKE_FD
+    (void)observed_epoch;
+    const int wake_fd = s->identity->wake.fd;
+    if (wake_fd >= 0) {
+        const int timeout = needs_backstop ? 5 : 1000;
+        if (fds.size() + 1 <= 33) {
+            // Common case: no heap allocation on the wait path.
+            std::array<pollfd, 33> set{};
+            size_t count = 0;
+            set[count++] = pollfd{wake_fd, POLLIN, 0};
+            for (const int fd : fds) if (fd >= 0) set[count++] = pollfd{fd, POLLIN, 0};
+            (void)::poll(set.data(), static_cast<nfds_t>(count), timeout);
+            if (set[0].revents & (POLLIN | POLLERR | POLLHUP)) {
+                uint64_t value = 0;
+                (void)::read(wake_fd, &value, sizeof(value));
+            }
+            return;
+        }
+        std::vector<pollfd> set;
+        set.reserve(fds.size() + 1);
+        set.push_back(pollfd{wake_fd, POLLIN, 0});
+        for (const int fd : fds) if (fd >= 0) set.push_back(pollfd{fd, POLLIN, 0});
+        (void)::poll(set.data(), static_cast<nfds_t>(set.size()), timeout);
+        if (set[0].revents & (POLLIN | POLLERR | POLLHUP)) {
+            uint64_t value = 0;
+            (void)::read(wake_fd, &value, sizeof(value));
+        }
+        return;
+    }
+    std::unique_lock<std::mutex> lock(s->mutex);
+    // Without an eventfd only accept/close signal s->work; a bounded 5 ms
+    // wait keeps cleanup-gate completion from stalling up to the watchdog.
+    s->work.wait_for(lock, std::chrono::milliseconds(needs_backstop || wake_fd < 0 ? 5 : 1000));
+#else
+    (void)fds;
+    (void)needs_backstop;
+    // The caller snapshotted the epoch before probing. Taking it here would
+    // swallow a notification that arrived during the probe and force a full
+    // timeout wait.
+    std::unique_lock<std::mutex> lock(s->identity->wake.mutex);
+    s->identity->wake.changed.wait_for(lock, std::chrono::milliseconds(5), [&] {
+        return s->identity->wake.epoch.load(std::memory_order_acquire) != observed_epoch;
+    });
+#endif
+}
+#else
+void wait_producer_progress(MgcSession *s, const std::vector<int> &, bool, uint64_t) noexcept
+{
+    std::unique_lock<std::mutex> lock(s->mutex);
+    s->work.wait_for(lock, std::chrono::milliseconds(5));
+}
+#endif
+#if defined(__ANDROID__)
+inline void close_poll_fd(int fd) noexcept { if (fd >= 0) ::close(fd); }
+#else
+inline void close_poll_fd(int) noexcept {}
+#endif
 void worker(MgcSession *s)
 {
     worker_session = s;
+    // Accepted tickets stay in this worker-local list between probes. Only a
+    // new acceptance takes the session lock, so a blocked ticket does not
+    // bounce through s->queue on every wake. A blocked ticket remains counted
+    // by s->in_flight, which keeps it alive and makes the reorder safe:
+    // accept() still rejects a second ticket that references an in-flight
+    // resource, so independent tickets are the only ones reordered.
+    std::vector<MgcTicket *> pending;
+    std::vector<int> poll_fds;
     for (;;)
     {
-        MgcTicket *t;
         {
             std::unique_lock<std::mutex> lock(s->mutex);
-            s->work.wait(lock, [&] { return s->closing || !s->queue.empty(); });
-            if (s->queue.empty())
+            if (s->queue.empty() && pending.empty())
             {
-                if (s->closing)
-                    break;
-                continue;
+                s->work.wait(lock, [&] { return s->closing || !s->queue.empty(); });
+                if (s->queue.empty())
+                {
+                    if (s->closing)
+                        break;
+                    continue;
+                }
             }
-            t = s->queue.front();
-            s->queue.pop_front();
+            // Drain every newly accepted ticket before probing, so a newly
+            // ready submission is always considered in this cycle.
+            while (!s->queue.empty())
+            {
+                pending.push_back(s->queue.front());
+                s->queue.pop_front();
+            }
         }
+        poll_fds.clear();
+        MgcTicket *t = nullptr;
+        ProducerGateResult gate;
+        bool needs_backstop = false;
+#if MGC_HAVE_PRODUCER_WAKE && !MGC_PRODUCER_WAKE_FD
+        // Snapshot before probing: a notify during the probe must still be
+        // observed by the wait, otherwise it is swallowed and the worker
+        // waits a full timeout for an event that already happened.
+        const uint64_t observed_epoch = s->identity->wake.epoch.load(std::memory_order_acquire);
+#else
+        const uint64_t observed_epoch = 0;
+#endif
+        for (size_t index = 0; index < pending.size(); ++index)
+        {
+            ProducerGateResult result = probe_producer_gate(pending[index], poll_fds);
+            if (result.gate != ProducerGate::Waiting)
+            {
+                t = pending[index];
+                gate = result;
+                pending.erase(pending.begin() + index);
+                break;
+            }
+            if (!result.inspectable) needs_backstop = true;
+        }
+        if (!t)
+        {
+            wait_producer_progress(s, poll_fds, needs_backstop, observed_epoch);
+            for (const int fd : poll_fds) close_poll_fd(fd);
+            continue;
+        }
+        for (const int fd : poll_fds) close_poll_fd(fd);
         uint64_t cpu_begin = 0, cpu_end = 0;
         const bool cpu_begin_observed = thread_cpu_ns(cpu_begin);
-        MgcStatus status = MGC_CANCELLED;
+        MgcStatus status = gate.status;
+        const bool producer_gate_skipped = gate.producer_gate_skipped;
+        const bool dependency_failed = status != MGC_SUCCESS;
+#if defined(MGC_TEST_GUARDED_HOST)
+        if (!dependency_failed && t->guarded_submission) mgc_test_after_guard_ready(t);
+#endif
         bool resuming = false;
         for (;;) {
-            if (!t->cancelled.load()) {
+            if (!t->cancelled.load() && !dependency_failed) {
                 bool explicit_gpu = false;
 #if MGC_HAVE_NCNN && NCNN_VULKAN
                 explicit_gpu = s->domain->device && (t->host_flags & MGC_HOST_JOB_EXPLICIT_GPU_SCOPES);
@@ -848,12 +1232,18 @@ void worker(MgcSession *s)
             // No device slot or session lock is held during retirement polls.
             // Cancellation cannot skip a poll or make this backoff spin.
             for (;;) {
+#if MGC_HAVE_PRODUCER_WAKE && !MGC_PRODUCER_WAKE_FD
+                const uint64_t retire_epoch = s->identity->wake.epoch.load(std::memory_order_acquire);
+#else
+                const uint64_t retire_epoch = 0;
+#endif
                 MgcStatus retired = MGC_INTERNAL_ERROR;
                 try { retired = t->retire(t->retire_context,t); } catch (...) {}
                 if (retired == MGC_SUCCESS) break;
                 if (retired == MGC_DEVICE_LOST) { t->deferred_failure = retired; t->resume_allowed = false; }
-                std::unique_lock<std::mutex> wait_lock(s->mutex);
-                s->work.wait_for(wait_lock,std::chrono::milliseconds(5));
+                // Retirement is a bounded poll; a wake (completion, cancel,
+                // close) or the 5 ms backstop decides when to retry.
+                wait_producer_progress(s, {}, true, retire_epoch);
             }
             t->deferred = false;
             t->retire = nullptr; t->retire_context = nullptr;
@@ -865,7 +1255,28 @@ void worker(MgcSession *s)
         }
         t->operation_state.reset();
         invoke_context(t->finalize,t->desc.context);
-        if(status==MGC_DEVICE_LOST){for(auto* lease:t->leases)if(lease->desc.access==MGC_ACCESS_WRITE){std::lock_guard<std::mutex> lock(lease->resource->mutex);lease->resource->content_invalid=true;}}
+        // For guarded work, serialize the cancellation decision with ticket
+        // completion before dropping any resource's in-flight protection.
+        // No caller or producer callback executes while this lock is held.
+        std::unique_lock<std::mutex> completion_lock(t->mutex, std::defer_lock);
+        bool guarded_cancelled = false;
+#if MGC_HAVE_PRODUCER_WAKE
+        if (t->guarded_submission) {
+            completion_lock.lock();
+            guarded_cancelled = t->cancelled.load();
+        }
+#endif
+        if(status==MGC_DEVICE_LOST||status==MGC_PRODUCER_FAILED||
+            (dependency_failed && (status != MGC_CANCELLED || producer_gate_skipped)) || guarded_cancelled) {
+            for (auto *lease : t->leases) {
+                std::lock_guard<std::mutex> lock(lease->resource->mutex);
+                if (lease->desc.access == MGC_ACCESS_WRITE) {
+                    lease->resource->content_invalid = true;
+                    lease->resource->content_failure = guarded_cancelled && status != MGC_DEVICE_LOST &&
+                        status != MGC_PRODUCER_FAILED ? MGC_CANCELLED : status;
+                }
+            }
+        }
         const bool cpu_end_observed = thread_cpu_ns(cpu_end);
         MgcCompletion result{};
         if (cpu_begin_observed && cpu_end_observed && cpu_end >= cpu_begin)
@@ -876,7 +1287,13 @@ void worker(MgcSession *s)
         // Physical work is retired. Keep submission references through callback,
         // while allowing a completion consumer to read/publish the finished data.
         for (auto *l : t->leases)
-        { std::lock_guard<std::mutex> lock(l->resource->mutex); --l->resource->in_flight; }
+        {
+            std::lock_guard<std::mutex> lock(l->resource->mutex);
+            --l->resource->in_flight;
+#if MGC_HAVE_PRODUCER_WAKE
+            unregister_producer_waiter_locked(l->resource, producer_wake_alias(t->session_identity));
+#endif
+        }
         result.header = MGC_HEADER_INIT(MgcCompletion);
         result.request_id = t->desc.request_id;
         result.execution_retired = 1;
@@ -891,13 +1308,13 @@ void worker(MgcSession *s)
         record_event(t, MGC_EVENT_EXECUTION_RETIRED, 0);
         result.batch_event_coverage_observed = t->desc.batch_event && t->event_complete && !t->gpu_pending;
         {
-            std::lock_guard<std::mutex> lock(t->mutex);
+            if (!completion_lock.owns_lock()) completion_lock.lock();
             const bool cancelled = t->cancelled.load();
             if (cancelled)
                 result.result_discarded = 1;
             // Cancellation suppresses publication, but must not hide a device
             // failure which occurred while the accepted job was executing.
-            if (cancelled && status != MGC_DEVICE_LOST)
+            if (cancelled && status != MGC_DEVICE_LOST && status != MGC_PRODUCER_FAILED)
             {
                 result.terminal = MGC_TERMINAL_CANCELLED;
                 result.status = MGC_CANCELLED;
@@ -912,6 +1329,7 @@ void worker(MgcSession *s)
             t->result = result;
             t->done = true;
         }
+        completion_lock.unlock();
         if (t->desc.batch_event) for (const auto &event : t->events) {
             try { t->desc.batch_event(t->desc.context, &event); } catch (...) {}
         }
@@ -968,12 +1386,20 @@ MgcStatus accept(MgcSession *s, std::unique_ptr<MgcTicket> &t, MgcTicket **out)
     for (auto *r : resources)
         if (r->maps || r->in_flight)
             return MGC_BUSY;
+        else if (r->content_invalid) return r->content_failure;
 #if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__)
     for (auto *l : t->leases)
     {
         auto *r = l->resource;
         if (r->ownership_uncertain || r->external_transition || r->external_access_state == 1 || r->external_access_state == 2 ||
-            (r->external_access_state == 3 && r->external_access_lease != l)) return MGC_BUSY;
+            (!meguviz_compute_detail::same_producer_content(r->external_access_state, l->desc.content_id, r->current_content))) return MGC_BUSY;
+    }
+#endif
+#if defined(MGC_TEST_GUARDED_HOST)
+    for (auto *l : t->leases) {
+        auto *r = l->resource;
+        if (r->test_guard && !meguviz_compute_detail::same_producer_content(3, l->desc.content_id, r->current_content))
+            return MGC_BUSY;
     }
 #endif
     std::unique_lock<std::mutex> lock(s->mutex);
@@ -984,6 +1410,20 @@ MgcStatus accept(MgcSession *s, std::unique_ptr<MgcTicket> &t, MgcTicket **out)
     t->session_identity = s->identity;
     t->domain = s->domain;
     s->queue.push_back(t.get());
+#if MGC_HAVE_PRODUCER_WAKE
+    const auto producer_wake = producer_wake_alias(s->identity);
+    for (auto *resource : resources) {
+#if defined(MGC_TEST_GUARDED_HOST)
+        if (resource_guarded_content_locked(resource)) t->guarded_submission = true;
+        if (resource->test_guard) register_producer_waiter_locked(resource, producer_wake);
+#else
+        if (resource->ahb) {
+            if (resource_guarded_content_locked(resource)) t->guarded_submission = true;
+            register_producer_waiter_locked(resource, producer_wake);
+        }
+#endif
+    }
+#endif
     t->measurement_flags = s->domain->measurement_flags.load();
     record_event(t.get(), MGC_EVENT_ACCEPTED, 0);
     ++s->in_flight;
@@ -994,11 +1434,83 @@ MgcStatus accept(MgcSession *s, std::unique_ptr<MgcTicket> &t, MgcTicket **out)
     lock.unlock();
     locks.clear();
     s->work.notify_one();
+#if MGC_HAVE_PRODUCER_WAKE
+    // The worker may be blocked on a dependency poll instead of s->work.
+    s->identity->wake.notify();
+#endif
     return MGC_ACCEPTED;
 }
 } // namespace
 extern "C"
 {
+#if defined(MGC_TEST_GUARDED_HOST)
+    // Test-only hooks: exercise real host accept/worker semantics without an
+    // Android device. No symbols or fields exist in production builds.
+    MgcStatus mgc_test_guard_arm(MgcLease *lease, uint64_t generation)
+    {
+        if (!lease || !generation) return MGC_INVALID_ARGUMENT;
+        auto *r = lease->resource;
+        std::lock_guard<std::mutex> lock(r->mutex);
+        if (r->test_guard || r->test_producer_pin) return MGC_BUSY;
+        r->test_generation = generation; r->test_guard = 1; r->test_fence_status = MGC_BUSY;
+        set_guarded_content_locked(r, true);
+        r->test_producer_pin = lease; mgc_lease_retain(lease);
+        return MGC_SUCCESS;
+    }
+    MgcStatus mgc_test_guard_fence(MgcLease *lease, uint64_t generation, MgcStatus status)
+    {
+        if (!lease || (status != MGC_SUCCESS && status != MGC_BUSY && status != MGC_PRODUCER_FAILED && status != MGC_INTERNAL_ERROR))
+            return MGC_INVALID_ARGUMENT;
+        auto *r = lease->resource; MgcLease *pin = nullptr; ProducerWakeList wake{};
+        {
+            std::lock_guard<std::mutex> lock(r->mutex);
+            if (!r->test_producer_pin || r->test_generation != generation || r->test_producer_pin != lease) return MGC_INVALID_ARGUMENT;
+            r->test_fence_status = status;
+            if (status == MGC_PRODUCER_FAILED) { r->content_invalid = true; r->content_failure = status; r->test_guard = 3; }
+            else if (status == MGC_SUCCESS && r->test_guard == 2) {
+                pin = r->test_producer_pin; r->test_producer_pin = nullptr; r->test_guard = 0;
+            }
+            wake = producer_waiters_locked(r);
+        }
+        notify_producer_waiters(wake);
+        if (pin) mgc_lease_release(pin);
+        return MGC_SUCCESS;
+    }
+    MgcStatus mgc_test_guard_finish(MgcLease *lease, uint64_t generation, MgcStatus status)
+    {
+        if (!lease) return MGC_INVALID_ARGUMENT;
+        auto *r = lease->resource; MgcLease *pin = nullptr; ProducerWakeList wake{};
+        {
+            std::lock_guard<std::mutex> lock(r->mutex);
+            if (!r->test_producer_pin || r->test_producer_pin != lease) return MGC_INVALID_ARGUMENT;
+            const auto rc = meguviz_compute_detail::finish_producer_guard(r->test_guard, r->test_generation,
+                generation, status, r->content_invalid, r->content_failure);
+            if (rc != MGC_SUCCESS) return rc;
+            if (r->test_guard == 2 && r->test_fence_status == MGC_SUCCESS) {
+                pin = r->test_producer_pin; r->test_producer_pin = nullptr; r->test_guard = 0;
+            }
+            wake = producer_waiters_locked(r);
+        }
+        notify_producer_waiters(wake);
+        if (pin) mgc_lease_release(pin);
+        return MGC_SUCCESS;
+    }
+    uint32_t mgc_test_guard_pin(MgcLease *lease)
+    {
+        if (!lease) return 0;
+        std::lock_guard<std::mutex> lock(lease->resource->mutex);
+        return lease->resource->test_producer_pin ? 1u : 0u;
+    }
+    uint32_t mgc_test_guard_waiters(MgcLease *lease)
+    {
+        if (!lease) return 0;
+        std::lock_guard<std::mutex> lock(lease->resource->mutex);
+        uint32_t count = 0;
+        for (const auto &waiter : lease->resource->producer_waiters)
+            if (!waiter.expired()) ++count;
+        return count;
+    }
+#endif
     MgcStatus mgc_query_build_info(MgcBuildInfo *info)
     {
         MgcBuildInfo v{};
@@ -1255,14 +1767,14 @@ extern "C"
     }
     MgcStatus mgc_domain_capability(MgcDomain *d, uint32_t feature, MgcCapability *out)
     {
-        if (!d || feature < 1 || feature > MGC_CAP_APPROVED_SHADER_PROFILE)
+        if (!d || feature < 1 || feature > MGC_CAP_GUARDED_PRODUCER_FENCE)
             return MGC_INVALID_ARGUMENT;
         MgcCapability v{};
         v.header = MGC_HEADER_INIT(MgcCapability);
         v.feature = feature;
         v.probe_result = MGC_UNSUPPORTED_CAPABILITY;
         v.reason = MGC_UNSUPPORTED_CAPABILITY;
-        if (feature == MGC_CAP_CPU_REFERENCE || feature == MGC_CAP_HOST_JOB_ASYNC)
+        if (feature == MGC_CAP_CPU_REFERENCE || feature == MGC_CAP_HOST_JOB_ASYNC || feature == MGC_CAP_EXTERNAL_HOST_MEMORY)
         {
             v.advertised = v.enabled = v.workload_qualified = 1;
             v.probe_result = v.reason = MGC_SUCCESS;
@@ -1299,6 +1811,11 @@ extern "C"
             else v.enabled = 0;
         }
 #if defined(__ANDROID__)
+        if (d->device && feature == MGC_CAP_GUARDED_PRODUCER_FENCE && MGC_ENABLE_GUARDED_PRODUCER_FENCE) {
+            v.advertised = v.enabled = d->device->info.support_VK_ANDROID_external_memory_android_hardware_buffer() &&
+                d->device->info.support_VK_EXT_queue_family_foreign();
+            if (v.enabled) v.probe_result = v.reason = MGC_SUCCESS;
+        }
         if (d->device && (feature == MGC_CAP_AHB_IMPORT || feature == MGC_CAP_VULKAN_AHB_SAMPLEABLE || feature == MGC_CAP_VULKAN_AHB_STORAGE))
         {
             v.advertised = v.enabled = d->device->info.support_VK_ANDROID_external_memory_android_hardware_buffer() && d->device->info.support_VK_EXT_queue_family_foreign();
@@ -1318,7 +1835,8 @@ extern "C"
 #endif
         return output_struct(out, &v, sizeof(v), offsetof(MgcCapability, reserved));
     }
-    MgcStatus mgc_resource_create(MgcDomain *d, const MgcResourceDesc *input, MgcResource **out)
+    static MgcStatus resource_create_impl(MgcDomain *d, const MgcResourceDesc *input,
+                                         const MgcHostMemoryDesc *external, MgcResource **out)
     {
         if (!d || !out)
             return MGC_INVALID_ARGUMENT;
@@ -1332,6 +1850,8 @@ extern "C"
             return rc;
         if (!v.capacity_bytes || v.capacity_bytes > SIZE_MAX || v.format < 1 || v.format > 4 ||
             v.usage > MGC_RESOURCE_GPU_BUFFER)
+            return MGC_INVALID_ARGUMENT;
+        if (external && (v.usage != 0 || external->capacity_bytes != v.capacity_bytes))
             return MGC_INVALID_ARGUMENT;
         if (v.usage == MGC_RESOURCE_GPU_BUFFER &&
             (d->runtime->provider != MGC_PROVIDER_NCNN_VULKAN || v.capacity_bytes % 4 ||
@@ -1378,7 +1898,7 @@ extern "C"
                     throw std::bad_alloc();
 #endif
                 }
-                else res->data.resize(static_cast<size_t>(v.capacity_bytes));
+                else if (!external) res->data.resize(static_cast<size_t>(v.capacity_bytes));
             }
             catch (...)
             {
@@ -1386,7 +1906,7 @@ extern "C"
                 r->live_bytes -= v.capacity_bytes;
                 throw;
             }
-            res->accounted_bytes = res->data.capacity();
+            res->accounted_bytes = external ? v.capacity_bytes : res->data.capacity();
 #if MGC_HAVE_NCNN && NCNN_VULKAN
             if (v.usage == MGC_RESOURCE_GPU_BUFFER) res->accounted_bytes = res->gpu_buffer.data->capacity;
 #endif
@@ -1416,7 +1936,14 @@ extern "C"
             }
             res->domain = d;
             res->desc = v;
-            { std::lock_guard<std::mutex> lock(r->mutex); allocation_change(d, res->accounted_bytes, false, true); }
+            if (external) {
+                res->external_data = static_cast<unsigned char *>(external->data);
+                res->external_access = external->access;
+                res->external_context = external->context;
+                res->external_release = external->release;
+                res->imported_allocation = true;
+            }
+            { std::lock_guard<std::mutex> lock(r->mutex); allocation_change(d, res->accounted_bytes, res->imported_allocation, true); }
             mgc_domain_retain(d);
             *out = res.release();
             return MGC_SUCCESS;
@@ -1425,6 +1952,31 @@ extern "C"
         {
             return MGC_OUT_OF_MEMORY;
         }
+    }
+    MgcStatus mgc_resource_create(MgcDomain *d, const MgcResourceDesc *input, MgcResource **out)
+    {
+        return resource_create_impl(d, input, nullptr, out);
+    }
+    MgcStatus mgc_resource_import_host_v1(MgcDomain *d, const MgcResourceDesc *input,
+                                          const MgcHostMemoryDesc *external, MgcResource **out)
+    {
+        if (!out) return MGC_INVALID_ARGUMENT;
+        *out = nullptr;
+        MgcHostMemoryDesc v{};
+        MgcStatus status = read_desc(external, v, sizeof(MgcHostMemoryDesc));
+        if (status != MGC_SUCCESS) return status;
+        status = flags(v.required_flags, v.reserved, sizeof(v.reserved));
+        if (status != MGC_SUCCESS) return status;
+        if (!v.data || !v.capacity_bytes || !v.retain || !v.release ||
+            (v.access != MGC_ACCESS_READ && v.access != MGC_ACCESS_WRITE)) return MGC_INVALID_ARGUMENT;
+        try { v.retain(v.context); }
+        catch (...) { return MGC_INTERNAL_ERROR; }
+        status = resource_create_impl(d, input, &v, out);
+        if (status != MGC_SUCCESS) {
+            try { v.release(v.context); }
+            catch (...) { return MGC_INTERNAL_ERROR; }
+        }
+        return status;
     }
     void mgc_resource_retain(MgcResource *r)
     {
@@ -1466,7 +2018,10 @@ extern "C"
             d->runtime->live_bytes -= r->budget_bytes;
             allocation_change(d, r->accounted_bytes, r->imported_allocation, false);
         }
+        const auto external_release = r->external_release;
+        void *external_context = r->external_context;
         delete r;
+        invoke_context(external_release, external_context);
         mgc_domain_release(d);
     }
     MgcStatus mgc_lease_create(MgcResource *r, const MgcLeaseDesc *input, MgcLease **out)
@@ -1489,6 +2044,8 @@ extern "C"
             d.byte_length > r->desc.capacity_bytes - d.byte_offset ||
             (d.access != MGC_ACCESS_READ && d.access != MGC_ACCESS_WRITE))
             return MGC_INVALID_ARGUMENT;
+        if (r->external_data && r->external_access == MGC_ACCESS_READ && d.access == MGC_ACCESS_WRITE)
+            return MGC_UNSUPPORTED_CAPABILITY;
         if (d.dependency_kind != MGC_DEPENDENCY_READY || d.dependency_id)
             return MGC_UNSUPPORTED_CAPABILITY;
 #if MGC_HAVE_NCNN && NCNN_VULKAN
@@ -1503,7 +2060,7 @@ extern "C"
             {
             std::unique_lock<std::mutex> lock(r->mutex, std::try_to_lock);
             if (!lock.owns_lock()) return MGC_BUSY;
-            if(d.access==MGC_ACCESS_READ&&r->content_invalid)return MGC_DEVICE_LOST;
+            if(d.access==MGC_ACCESS_READ&&r->content_invalid)return r->content_failure;
             if (r->writers || (d.access == MGC_ACCESS_WRITE && r->readers))
                 return MGC_BUSY;
             if (d.access == MGC_ACCESS_WRITE && (r->maps || r->in_flight)) return MGC_BUSY;
@@ -1520,6 +2077,10 @@ extern "C"
                 ++r->writers;
                 r->current_content = d.content_id;
                 r->content_invalid = false;
+                r->content_failure = MGC_DEVICE_LOST;
+#if MGC_HAVE_PRODUCER_WAKE
+                set_guarded_content_locked(r, false);
+#endif
             }
             else
             {
@@ -1580,7 +2141,7 @@ extern "C"
         if (!l)
             return MGC_INVALID_ARGUMENT;
         std::lock_guard<std::mutex> lock(l->resource->mutex);
-        if(l->resource->content_invalid)return MGC_DEVICE_LOST;
+        if(l->resource->content_invalid)return l->resource->content_failure;
         MgcLeaseInfo v{};
         v.header = MGC_HEADER_INIT(MgcLeaseInfo);
         v.domain_id = l->resource->domain->id;
@@ -1617,7 +2178,7 @@ extern "C"
         *bytes = 0;
         if (l->resource->desc.usage) return MGC_UNSUPPORTED_CAPABILITY;
         std::lock_guard<std::mutex> lock(l->resource->mutex);
-        if (l->resource->content_invalid) return MGC_DEVICE_LOST;
+        if (l->resource->content_invalid) return l->resource->content_failure;
         bool own = active_ticket &&
                    std::find(active_ticket->leases.begin(), active_ticket->leases.end(), l) !=
                        active_ticket->leases.end();
@@ -1626,7 +2187,7 @@ extern "C"
         ++l->maps;
         ++l->resource->maps;
         mgc_lease_retain(l);
-        *data = l->resource->data.data() + l->desc.byte_offset;
+        *data = l->resource->host_data() + l->desc.byte_offset;
         *bytes = l->desc.byte_length;
         return MGC_SUCCESS;
     }
@@ -1705,6 +2266,9 @@ extern "C"
             std::lock_guard<std::mutex> lock(s->mutex);
             s->closing = true;
             s->work.notify_all();
+#if MGC_HAVE_PRODUCER_WAKE
+            s->identity->wake.notify();
+#endif
             if (s->in_flight || s->preparing)
                 return MGC_BUSY;
         }
@@ -1785,12 +2349,22 @@ extern "C"
     {
         if (!t)
             return MGC_INVALID_ARGUMENT;
-        std::lock_guard<std::mutex> lock(t->mutex);
-        if (!t->done)
         {
-            t->cancelled.store(true);
-            t->result.result_discarded = 1;
+            std::lock_guard<std::mutex> lock(t->mutex);
+            if (!t->done)
+            {
+#if MGC_HAVE_PRODUCER_WAKE
+                // Guarded private output transfer is an irrevocable publish
+                // point: cancellation cannot promise to retract that result.
+                if (t->guarded_submission.load() && t->guarded_write_published) return MGC_BUSY;
+#endif
+                t->cancelled.store(true);
+                t->result.result_discarded = 1;
+            }
         }
+#if MGC_HAVE_PRODUCER_WAKE
+        if (t->session_identity) t->session_identity->wake.notify();
+#endif
         return MGC_SUCCESS;
     }
     MgcStatus mgc_private_session_cancel(MgcSession *s, MgcTicket *t)
@@ -1927,17 +2501,29 @@ extern "C"
     { return ticket && ticket == active_ticket && ticket->deferred ? 1u : 0u; }
     MgcStatus mgc_private_ticket_release_retired_write(MgcTicket *ticket, MgcLease *lease)
     {
-        if(!ticket||ticket!=active_ticket||!lease||lease->resource->domain!=ticket->domain||
-            lease->desc.access!=MGC_ACCESS_WRITE)return MGC_INVALID_ARGUMENT;
+        if(!ticket||ticket!=active_ticket||!lease||lease->resource->domain!=ticket->domain)return MGC_INVALID_ARGUMENT;
         if(ticket->deferred||ticket->gpu_batch)return MGC_BUSY;
         if(std::count(ticket->leases.begin(),ticket->leases.end(),lease)!=1)return MGC_INVALID_ARGUMENT;
         auto found=std::find(ticket->leases.begin(),ticket->leases.end(),lease);
+#if MGC_HAVE_PRODUCER_WAKE
+        std::unique_lock<std::mutex> ticket_lock(ticket->mutex);
+        const bool guarded = ticket->guarded_submission.load();
+        if (guarded && ticket->cancelled.load()) return MGC_CANCELLED;
+#endif
         {
             std::lock_guard<std::mutex> lock(lease->resource->mutex);
+            if (lease->desc.access != MGC_ACCESS_WRITE) return MGC_INVALID_ARGUMENT;
             if(lease->resource->in_flight!=1||lease->resource->maps)return MGC_BUSY;
             --lease->resource->in_flight;
+#if MGC_HAVE_PRODUCER_WAKE
+            unregister_producer_waiter_locked(lease->resource, producer_wake_alias(ticket->session_identity));
+#endif
         }
         ticket->leases.erase(found);
+#if MGC_HAVE_PRODUCER_WAKE
+        ticket->guarded_write_published = true;
+        ticket_lock.unlock();
+#endif
         mgc_lease_release(lease);
         return MGC_SUCCESS;
     }

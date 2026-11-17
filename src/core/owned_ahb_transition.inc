@@ -163,6 +163,7 @@ private:
         export_succeeded_ = true; exported_fd_ = fd;
     }
     MgcStatus prepare_and_submit(uint64_t wait_ns) {
+        (void)wait_ns;
         if (!lease_ || !resource_) return finish_unsubmitted(MGC_INVALID_ARGUMENT);
         if (!resource_->ahb) return finish_unsubmitted(MGC_SUCCESS);
         device_ = resource_->domain->device;
@@ -172,15 +173,18 @@ private:
             std::lock_guard<std::mutex> lock(resource_->mutex);
             if (resource_->ownership_uncertain || (resource_->external_transition && !own_transition_) ||
                 resource_->external_access_state == 1 || resource_->external_access_state == 2 ||
-                (resource_->external_access_state == 3 && (!acquire_ || resource_->external_access_lease != lease_)))
+                (resource_->external_access_state == 3 && (!acquire_ || !meguviz_compute_detail::same_producer_content(resource_->external_access_state, lease_->desc.content_id, resource_->current_content))))
                 return finish_unsubmitted(MGC_BUSY);
             if (acquire_ != resource_->externally_owned) return finish_unsubmitted(MGC_SUCCESS);
         }
         const bool native = lease_->sync_mode == MGC_ANDROID_GPU_SYNC_FD;
         if (native && (!device_->vkImportSemaphoreFdKHR || !device_->vkGetSemaphoreFdKHR))
             return finish_unsubmitted(MGC_UNSUPPORTED_CAPABILITY);
-        if (acquire_ && !native) {
-            const auto ready = wait_ready(lease_, wait_ns);
+        if (acquire_) {
+            // Even a GPU sync-fd semaphore may signal with an error. Do not
+            // issue a Vulkan ownership barrier until userspace has verified
+            // both the producer status and any host cleanup guard.
+            const auto ready = wait_ready(lease_, 0);
             if (ready == MGC_TIMEOUT || ready == MGC_BUSY) return MGC_BUSY;
             if (ready != MGC_SUCCESS) return finish_unsubmitted(ready);
         }

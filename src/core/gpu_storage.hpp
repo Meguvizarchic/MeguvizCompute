@@ -10,6 +10,15 @@ public:
     VkAndroidHardwareBufferFormatPropertiesANDROID format{};
     bool valid = false;
     VkResult last_result = VK_SUCCESS;
+#if MGC_ENABLE_GUARDED_PRODUCER_FENCE
+    // This allocator already exists for each AHB import, so the weak waiters
+    // add no per-AHB allocation. accept() rejects a second ticket while a
+    // resource is in flight; a private batch may also register a requested
+    // lease that is not counted in-flight, so keep a small bounded array and
+    // let the watchdog backstop cover contention beyond its capacity.
+    std::array<std::weak_ptr<ProducerWake>, 2> producer_waiters;
+    bool guarded_content = false;
+#endif
     explicit AhbAllocator(const ncnn::VulkanDevice *device, AHardwareBuffer *ahb)
         : VkAllocator(device), buffer(ahb)
     {

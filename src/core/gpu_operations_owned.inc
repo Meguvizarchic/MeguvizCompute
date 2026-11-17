@@ -82,7 +82,7 @@ struct GpuOperationWork {
         } else {
             upload.create(int((input_bytes+3)/4),size_t(4));if(upload.empty())return MGC_OUT_OF_MEMORY;
             std::memset(upload.data,0,upload.total()*4);
-            std::memcpy(upload.data,desc.input->resource->data.data()+desc.input->desc.byte_offset,size_t(input_bytes));
+            std::memcpy(upload.data,desc.input->resource->host_data()+desc.input->desc.byte_offset,size_t(input_bytes));
             scope.command->record_clone(upload,input,opt);if(input.empty())return MGC_OUT_OF_MEMORY;
         }
         return MGC_SUCCESS;
@@ -129,7 +129,7 @@ struct GpuOperationWork {
             if(w.output_view<0){
                 w.output_seed.create(int((w.output_bytes+3)/4),size_t(4));if(w.output_seed.empty())return MGC_OUT_OF_MEMORY;
                 std::memset(w.output_seed.data,0,w.output_seed.total()*4);
-                std::memcpy(w.output_seed.data,b->data.data()+w.desc.output->desc.byte_offset,size_t(w.output_bytes));
+                std::memcpy(w.output_seed.data,b->host_data()+w.desc.output->desc.byte_offset,size_t(w.output_bytes));
                 command.record_clone(w.output_seed,w.output,opt);if(w.output.empty())return MGC_OUT_OF_MEMORY;
             }
             auto* pipeline=kernel_pipeline(w.domain,resize_rgb_shader);if(!pipeline)return MGC_INTERNAL_ERROR;
@@ -196,7 +196,7 @@ struct GpuOperationWork {
     MgcStatus copy_download() {
         if(output_view>=0)return MGC_SUCCESS;
         if(download.empty())return MGC_OUT_OF_MEMORY;
-        std::memcpy(desc.output->resource->data.data()+desc.output->desc.byte_offset,download.data,size_t(output_bytes));
+        std::memcpy(desc.output->resource->host_data()+desc.output->desc.byte_offset,download.data,size_t(output_bytes));
         return MGC_SUCCESS;
     }
 };
@@ -216,7 +216,7 @@ MgcStatus run_gpu_operation_owned(MgcTicket *ticket) {
         if(work.desc.operation==MGC_OPERATION_COPY||work.desc.operation==MGC_OPERATION_RESIZE_RGB8){auto status=work.copy_download();if(status)return status;work.stage=4;return MGC_SUCCESS;}
         auto status=work.summarize();if(status)return status;
         if(work.desc.operation==MGC_OPERATION_STATISTICS_F32&&work.output_view<0){
-            std::memcpy(work.desc.output->resource->data.data()+work.desc.output->desc.byte_offset,&work.statistics,sizeof(work.statistics));work.stage=4;return MGC_SUCCESS;
+            std::memcpy(work.desc.output->resource->host_data()+work.desc.output->desc.byte_offset,&work.statistics,sizeof(work.statistics));work.stage=4;return MGC_SUCCESS;
         }
         if(work.desc.operation!=MGC_OPERATION_STATISTICS_F32&&work.statistics.finite_count!=work.statistics.count)return MGC_INVALID_ARGUMENT;
         work.stage=2;
