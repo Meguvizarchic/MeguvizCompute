@@ -21,7 +21,7 @@ cmake --install build/reference --config Release --prefix ./sdk
 在调用方将安装目录加入 `CMAKE_PREFIX_PATH`，包含 `<meguviz/compute.h>` 并链接：
 
 ```cmake
-find_package(MeguvizCompute 1.2.1 CONFIG REQUIRED)
+find_package(MeguvizCompute 1.2.2 CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE MeguvizCompute::core)
 ```
 

@@ -11,7 +11,7 @@ description: 在 C、C++ 或 Android NDK 项目中接入 MeguvizCompute，或迁
 
 | 需求 | 接入点 |
 | --- | --- |
-| CPU 操作或首次接入 | `find_package(MeguvizCompute 1.2.1 CONFIG REQUIRED)` 并链接 `MeguvizCompute::core`。公共头为 `<meguviz/compute.h>`，从 `examples/c_consumer.c` 的 COPY 链路开始。 |
+| CPU 操作或首次接入 | `find_package(MeguvizCompute 1.2.2 CONFIG REQUIRED)` 并链接 `MeguvizCompute::core`。公共头为 `<meguviz/compute.h>`，从 `examples/c_consumer.c` 的 COPY 链路开始。 |
 | Android GPU/AHardwareBuffer | 同一 Compute domain 内使用 `<meguviz/compute_android.h>`。检查实际 SDK/ABI、目标缓冲区的格式与 usage、所用同步模式和目标设备能力。保留调用方已有的兼容路径。 |
 | 内部 ncnn 算法适配 | 仅在适配器确实需要时链接 `MeguvizCompute::backend_ncnn_sdk`，以该 ABI 的 `MGC_REQUIRED_PRIVATE_SDK_FINGERPRINT` 匹配 Compute SDK。由 Compute 提供唯一 ncnn owner。 |
 

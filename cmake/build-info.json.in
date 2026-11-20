@@ -9,7 +9,13 @@
   "android_static_openmp": "@MGC_ANDROID_STATIC_OPENMP@",
   "android_openmp_runtime_sha256": "@MGC_OPENMP_RUNTIME_SHA256@",
   "android_openmp_notice_sha256": "@MGC_OPENMP_NOTICE_SHA256@",
-  "build_options": "@MGC_BUILD_OPTIONS@",
+  "build_options": "@MGC_BUILD_OPTIONS_JSON@",
+  "build_options_sha256": "@MGC_BUILD_OPTIONS_SHA256@",
+  "guarded_producer_fence": "@MGC_GUARDED_PRODUCER_FENCE_EXPERIMENTAL@",
+  "ncnn_layer_manifest_sha256": "@MGC_NCNN_LAYER_MANIFEST_SHA256@",
+  "ncnn_layer_state_sha256": "@MGC_NCNN_LAYER_STATE_SHA256@",
+  "ncnn_layer_registry_sha256": "@MGC_NCNN_LAYER_REGISTRY_SHA256@",
+  "ncnn_shader_registry_sha256": "@MGC_NCNN_SHADER_REGISTRY_SHA256@",
   "runtime_compiler_policy": "retained in Vulkan builds; no-runtime profile unsupported",
   "device_qualification": "NOT_RUN"
 }
