@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <meguviz/compute.h>
 #include <meguviz/compute_android.h>
@@ -1365,6 +1366,7 @@ MgcStatus accept(MgcSession *s, std::unique_ptr<MgcTicket> &t, MgcTicket **out)
 #endif
     for (auto *l : t->leases)
     {
+        if (!l) return MGC_INVALID_ARGUMENT;
 #if MGC_HAVE_NCNN && NCNN_VULKAN && defined(__ANDROID__)
         reap_external_ready(l->resource);
 #endif
@@ -1373,11 +1375,13 @@ MgcStatus accept(MgcSession *s, std::unique_ptr<MgcTicket> &t, MgcTicket **out)
             return rc;
     }
     std::vector<MgcResource *> resources;
+    resources.reserve(t->leases.size());
     for (auto *l : t->leases)
         resources.push_back(l->resource);
-    std::sort(resources.begin(), resources.end());
+    std::sort(resources.begin(), resources.end(), std::less<MgcResource *>{});
     resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
     std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(resources.size());
     for (auto *r : resources)
     {
         locks.emplace_back(r->mutex, std::try_to_lock);

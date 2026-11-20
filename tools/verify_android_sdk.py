@@ -65,7 +65,7 @@ extern "C" __attribute__((visibility("default"))) int mgc_test_owner_entry(MgcDo
     (src/'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.31)
 project(InstalledAndroidComputeConsumer LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
-find_package(MeguvizCompute 0.1 CONFIG REQUIRED)
+find_package(MeguvizCompute 1.2.1 CONFIG REQUIRED)
 add_library(compute_closure SHARED entry.cpp)
 target_link_libraries(compute_closure PRIVATE MeguvizCompute::backend_ncnn_sdk)
 target_link_options(compute_closure PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map" "-Wl,-z,max-page-size=16384" "-Wl,--no-undefined")

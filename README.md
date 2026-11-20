@@ -32,7 +32,7 @@ C ABI · 资源租约 · AHB 互操作 · shaderpack
 
 ---
 
-当前是可运行的 **0.1.0 开发 SDK**。Windows 与 Android 模拟器上的 CPU 公共契约、真实 ncnn CPU 小图已验证；ARM64/ARMv7 的 ncnn Vulkan 静态依赖闭包已交叉构建并从安装目录独立链接。`bil-rife-ncnn-android` 的完整 C1–C6 资格尚未完成，不能称为 GPU/AHB 插帧引擎发布候选。逐 gate 状态与实际证据见 [STATUS.json](STATUS.json)。
+当前是可运行的 **1.2.1 开发 SDK**。Windows 与 Android 模拟器上的 CPU 公共契约、真实 ncnn CPU 小图已验证；ARM64/ARMv7 的 ncnn Vulkan 静态依赖闭包已交叉构建并从安装目录独立链接。`bil-rife-ncnn-android` 的完整 C1–C6 资格尚未完成，不能称为 GPU/AHB 插帧引擎发布候选。逐 gate 状态与实际证据见 [STATUS.json](STATUS.json)。
 
 在 Codex 中打开本仓库后，输入 `$meguviz-compute` 并指定要接入或迁移的模块。技能会按实际 SDK 选择 CPU、Vulkan 或 Memory 借用路径，并运行相关验证。[接入与迁移技能](.agents/skills/meguviz-compute/SKILL.md)
 
@@ -67,7 +67,7 @@ C ABI · 资源租约 · AHB 互操作 · shaderpack
 安装目录为 `build/install/windows-cpu`、`build/install/android-arm64-api27` 与 `build/install/android-v7-api27`。Android 外部消费者同时设置 `CMAKE_FIND_ROOT_PATH` 与 `CMAKE_PREFIX_PATH` 指向目标 SDK；`MGC_REQUIRED_PRIVATE_SDK_FINGERPRINT` 必须匹配对应 ABI 的 `build-info.json`。Windows/Linux/各 Android ABI 的 private fingerprint 彼此不同，运行时 ncnn Options 不属于编译身份。
 
 ```cmake
-find_package(MeguvizCompute 0.1 CONFIG REQUIRED)
+find_package(MeguvizCompute 1.2.1 CONFIG REQUIRED)
 target_link_libraries(application PRIVATE MeguvizCompute::core)
 # 只有内部算法适配器才使用：
 target_link_libraries(algorithm PRIVATE MeguvizCompute::backend_ncnn_sdk)

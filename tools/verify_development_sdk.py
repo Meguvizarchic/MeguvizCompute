@@ -63,7 +63,7 @@ def main():
 project(InstalledComputeConsumer LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
-find_package(MeguvizCompute 0.1 CONFIG REQUIRED)
+find_package(MeguvizCompute 1.2.1 CONFIG REQUIRED)
 enable_testing()
 add_executable(public_c c_consumer.c)
 set_target_properties(public_c PROPERTIES LINKER_LANGUAGE CXX)
