@@ -1,0 +1,4 @@
+interface:
+  display_name: "MeguvizCompute 接入"
+  short_description: "将 C、C++ 和 Android NDK 缓冲及任务迁移到 Compute"
+  default_prompt: "请用 $meguviz-compute 检查当前工程，选择一条适合的缓冲或任务数据流接入 Compute，并运行针对性验证。"

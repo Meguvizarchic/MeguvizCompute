@@ -16,7 +16,7 @@ int main(void) {
     INIT(cap, MgcCapability); CHECK(mgc_domain_capability(domain, MGC_CAP_EXTERNAL_HOST_MEMORY, &cap) == MGC_SUCCESS);
     CHECK(cap.enabled && cap.advertised && cap.workload_qualified);
     struct backing b = {{0}, 1, 0, 0};
-    INIT(desc, MgcResourceDesc); desc.capacity_bytes = 64; desc.format = MGC_FORMAT_BYTES;
+    INIT(desc, MgcResourceDesc); desc.capacity_bytes = 64; desc.format = MGC_FORMAT_BYTES; desc.allocation_id = 7;
     INIT(host, MgcHostMemoryDesc); host.data = b.data; host.capacity_bytes = 64; host.access = MGC_ACCESS_READ;
     host.context = &b; host.retain = retain; host.release = release;
     MgcResource *resource = (MgcResource *)1;
@@ -26,6 +26,13 @@ int main(void) {
     host.capacity_bytes = 64;
     CHECK(mgc_resource_import_host_v1(domain, &desc, &host, &resource) == MGC_SUCCESS && resource);
     CHECK(b.refs == 2 && b.retained == 2);
+    MgcResource *rejected = resource;
+    CHECK(mgc_resource_import_host_v1(domain, &desc, &host, &rejected) == MGC_INVALID_ARGUMENT && !rejected);
+    INIT(other, MgcResourceDesc); other.capacity_bytes = 128; other.format = MGC_FORMAT_BYTES;
+    CHECK(mgc_resource_create(domain, &other, &rejected) == MGC_OUT_OF_MEMORY && !rejected);
+    INIT(stats, MgcAllocationStats);
+    CHECK(mgc_runtime_allocation_stats(runtime, &stats) == MGC_SUCCESS);
+    CHECK(stats.imported_live_bytes == 64 && stats.imported_live_count == 1 && stats.total_allocation_count == 1);
     INIT(ld, MgcLeaseDesc); ld.content_id = 1; ld.byte_offset = 4; ld.byte_length = 8; ld.access = MGC_ACCESS_WRITE;
     MgcLease *lease = (MgcLease *)1;
     CHECK(mgc_lease_create(resource, &ld, &lease) == MGC_UNSUPPORTED_CAPABILITY && !lease);
@@ -35,7 +42,7 @@ int main(void) {
     void *address = NULL; uint64_t bytes = 0;
     CHECK(mgc_lease_map(lease, &address, &bytes) == MGC_SUCCESS && address == b.data + 4 && bytes == 8);
     CHECK(mgc_lease_unmap(lease) == MGC_SUCCESS);
-    mgc_lease_release(lease); CHECK(b.refs == 1 && b.released == 2);
+    mgc_lease_release(lease); CHECK(b.refs == 1 && b.released == 3);
     host.access = MGC_ACCESS_WRITE;
     CHECK(mgc_resource_import_host_v1(domain, &desc, &host, &resource) == MGC_SUCCESS);
     ld.access = MGC_ACCESS_WRITE; ld.content_id = 2;
@@ -44,7 +51,12 @@ int main(void) {
     memset(address, 0x4e, (size_t)bytes);
     CHECK(mgc_lease_unmap(lease) == MGC_SUCCESS && b.data[4] == 0x4e && b.data[11] == 0x4e);
     mgc_resource_release(resource); mgc_lease_release(lease);
-    CHECK(b.refs == 1 && b.retained == 3 && b.released == 3);
+    CHECK(b.refs == 1 && b.retained == 4 && b.released == 4);
+    CHECK(mgc_domain_allocation_stats(domain, &stats) == MGC_SUCCESS);
+    CHECK(stats.imported_live_bytes == 0 && stats.imported_live_count == 0 &&
+        stats.imported_highwater_bytes == 64 && stats.total_allocation_count == 2);
+    CHECK(mgc_resource_create(domain, &other, &resource) == MGC_SUCCESS);
+    mgc_resource_release(resource);
     mgc_domain_release(domain); CHECK(mgc_runtime_close(runtime) == MGC_SUCCESS); mgc_runtime_release(runtime);
     puts("PASS external host resource read/write and rollback");
     return 0;

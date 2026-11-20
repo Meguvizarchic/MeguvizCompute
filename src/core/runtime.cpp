@@ -1876,7 +1876,7 @@ extern "C"
                         return MGC_OUT_OF_MEMORY;
                 } while (d->allocations.count({v.allocation_id, v.allocation_generation}));
             }
-            if (d->allocations.count({v.allocation_id, v.allocation_generation}))
+            else if (d->allocations.count({v.allocation_id, v.allocation_generation}))
                 return MGC_INVALID_ARGUMENT;
             auto *r = d->runtime;
             {
@@ -1912,7 +1912,8 @@ extern "C"
 #endif
             // The allocator may align a requested range. Only publish the
             // resource after that actual range fits the registered budget.
-            {
+            res->budget_bytes = res->accounted_bytes;
+            if (res->accounted_bytes != v.capacity_bytes) {
                 std::lock_guard<std::mutex> lock(r->mutex);
                 if (res->accounted_bytes > v.capacity_bytes &&
                     res->accounted_bytes - v.capacity_bytes > r->budget - r->live_bytes)
@@ -1921,8 +1922,7 @@ extern "C"
                     return MGC_OUT_OF_MEMORY;
                 }
                 r->live_bytes -= v.capacity_bytes;
-                r->live_bytes += res->accounted_bytes;
-                res->budget_bytes = res->accounted_bytes;
+                r->live_bytes += res->budget_bytes;
             }
             try
             {

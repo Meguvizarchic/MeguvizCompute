@@ -34,6 +34,8 @@ C ABI · 资源租约 · AHB 互操作 · shaderpack
 
 当前是可运行的 **0.1.0 开发 SDK**。Windows 与 Android 模拟器上的 CPU 公共契约、真实 ncnn CPU 小图已验证；ARM64/ARMv7 的 ncnn Vulkan 静态依赖闭包已交叉构建并从安装目录独立链接。`bil-rife-ncnn-android` 的完整 C1–C6 资格尚未完成，不能称为 GPU/AHB 插帧引擎发布候选。逐 gate 状态与实际证据见 [STATUS.json](STATUS.json)。
 
+在 Codex 中打开本仓库后，输入 `$meguviz-compute` 并指定要接入或迁移的模块。技能会按实际 SDK 选择 CPU、Vulkan 或 Memory 借用路径，并运行相关验证。[接入与迁移技能](.agents/skills/meguviz-compute/SKILL.md)
+
 ## 已实现
 
 - 版本化纯 C ABI；runtime/domain、资源身份与代际、内容 lease、显式 map/unmap。
