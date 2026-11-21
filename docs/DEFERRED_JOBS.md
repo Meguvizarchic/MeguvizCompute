@@ -1,90 +1,29 @@
-# Deferred accepted jobs in the private source SDK
+# 私有源码 SDK 延迟异步任务契约
 
-Private SDK 0.2.6 retains the 0.2.4 `MgcHostJobDesc` `resume` and `finalize` tail
-callbacks. Old complete descriptor prefixes default these callbacks to null;
-partial pointer fields and unknown required flags are rejected. The public C
-submit/completion structures keep their existing ownership contract.
+私有 SDK `0.2.6` 保留了 `0.2.4` 中 `MgcHostJobDesc` 尾部的 `resume` 与 `finalize` 回调。使用旧版完整前缀初始化的描述符会将这两个字段默认置空；若仅填写部分回调指针或传入未知 `required_flags`，提交将被拒绝。公共 C 接口的提交与完成结构体维持原有所有权规则不变。
 
-`mgc_private_ticket_defer` registers one retirement owner for the active job.
-Until its poll returns SUCCESS, the worker keeps the accepted task, session
-in-flight count, submission leases and context references. Cancellation marks
-the result discarded but cannot skip physical retirement, run the final
-callback early or make the polling backoff spin. Session drain/close still
-report TIMEOUT/BUSY while that ownership remains.
+## 1. 任务延迟托管与提前释放输出
 
-Only a fully recorded successful batch may resume the algorithm. A callback
-that stopped inside graph extraction is a failed operation even if its earlier
-GPU batch later retires. It is never replayed or treated as a complete graph.
-Final internal context cleanup precedes the one completion callback; both
-context finalization and user completion execute outside worker device locks.
+- `mgc_private_ticket_defer` 为当前执行中的任务注册一个异步收尾回调（`poll`）。在 `poll` 返回 `MGC_SUCCESS` 之前，工作线程会继续保留该已接收任务、session 在途计数、提交租约与上下文引用。
+- 若期间触发取消（`mgc_ticket_cancel`），系统仅标记结果作废，不会跳过底层任务收尾、提前触发完成回调，也不会让轮询退避变为忙等；在延迟任务结束前，调用 `mgc_session_drain` 或 `mgc_session_close` 仍会返回 `MGC_TIMEOUT` 或 `MGC_BUSY`。
+- 只有完整录制且成功提交的 GPU 批次才允许恢复后续算法（`resume`）。如果在图提取中途停止，即使此前已提交的 GPU 批次随后在硬件上执行完毕，该操作仍视为失败，不会重放或当作完整图继续执行。
+- 内部上下文清理（`finalize`）必定先于唯一的完成回调执行，且两者均在释放工作线程设备锁之后运行。
+- 当所有硬件和主机写操作均结束后，可通过 `mgc_private_ticket_release_retired_write` 提前撤回内部持有的唯一输出 `WRITE` 提交引用（要求任务为当前活动 ticket、租约未映射、无挂起批次且调用方另行持有独立 `WRITE` 引用）。随后调用方即可将该输出发布为 `READ` 并交给消费方；输入租约仍保留至完成回调结束。这让单槽位输出缓冲池能够在回调期间安全复用。
 
-An internal output WRITE reference may be transferred out of the ticket after
-all writes retire. `mgc_private_ticket_release_retired_write` requires the active
-ticket, a unique unmapped WRITE submission, no pending batch and a separate
-caller-owned writer reference. It removes only that submission reference and
-its in-flight count. The caller then publishes an owned READ result. Input
-references keep their normal through-callback lifetime; consumer release can
-therefore make a one-slot output pool reusable during the callback.
+## 2. 显式 GPU 作用域与模块卸载安全
 
-GPU jobs using `with_ncnn_gpu_owned` set
-`MGC_HOST_JOB_EXPLICIT_GPU_SCOPES`. Every device operation is serialized by its
-own explicit scope; the worker does not wrap the whole algorithm in the GPU
-mutex. CPU-domain jobs keep their own execution slot. This permits retirement
-backoff without holding the GPU slot and keeps unrelated CPU work progressing.
+- 使用 `with_ncnn_gpu_owned` 的任务会启用 `MGC_HOST_JOB_EXPLICIT_GPU_SCOPES`。每次设备操作仅由自身作用域串行保护，工作线程不再用同一把 GPU 互斥锁包裹整个算法，而 CPU domain 仍保有独立执行槽位，这样在 GPU 等待收尾退避时不会阻塞无关的 CPU 计算。
+- GPU session 在创建时会获取一份经过校验的代码镜像引用。托管批次仅在活动 ticket、session 身份、工作线程及 domain 全部匹配时借用该引用；独立作用域与合成作用域则各自持有独立引用。
+- `mgc_session_close` 会先等待工作线程退出再释放代码镜像引用；若释放失败，已关闭的 session 会保留该状态以供重试。宿主在 `mgc_session_close` 成功返回之前，必须一直保留自身的动态库加载引用。
 
-A GPU session acquires a verified code-image reference at creation. An owned
-batch borrows it only when its active ticket, session identity, worker and
-domain all match; standalone and synthetic scopes retain their own references.
-The session keeps its reference through accepted work, retirement and callback
-completion. `mgc_session_close` joins the worker before releasing it; if release
-fails, the closed session is retained for retry. The caller must keep a separate
-host loader reference through the successful close call and its return.
+## 3. 硬件作用域、AHB 交接与设备丢失
 
-The owned scope reserves its context before recording: heap command, retained
-algorithm state, all lease/view references, and Android acquire/release
-transitions. A normal initial wait is finite; an unresolved operation continues
-through zero-wait polls. A producer-readiness wait with no GPU work in use keeps
-its resource leases without quarantining an idle device. Possibly submitted
-work keeps the shared-device gate until physical confirmation.
+- 托管作用域在录制前就会预留全部所需上下文（堆分配命令、保留的算法状态、全部租约/视图引用以及 Android acquire/release 过渡状态）。常规首次等待采用有限超时，未决任务转入零等待轮询。若生产者依赖未就绪且尚无 GPU 任务下发，系统会继续保留租约而不会误隔离空闲设备；若工作可能已提交，则会一直守住共享设备门控直到硬件确认完成。
+- Android `AHardwareBuffer` 过渡操作各自保留独立的池、fence、semaphore 与 fd，不会重放已接收的提交。确定未提交且失败的释放尝试允许重试元数据对象（逻辑失败记录保留），仅在硬件过渡和元数据更新均确认完成后才交还资源所有权；生产者引用在 GPU 作用域外释放。
+- 受管的 `ncnn` 命令在修改缓冲区/图像/主机目标前会先记录 CPU 访问与布局快照：确定未提交的尾段可按快照回滚并丢弃，已处于挂起或不确定状态的提交不可回滚；主机收尾失败会被缓存，防止半截主机拷贝被重复执行。消费方仍须通过强引用上下文自行保障 `Net`、`Pipeline`、分配器、模型及外部主机目标的生命周期。
+- 通用 GPU 算子（`COPY`、`RELU_F32`、`NORMALIZE_F32`、`STATISTICS_F32` 与受支持的 `RESIZE_RGB8`）同样采用托管分级执行。`RESIZE_RGB8` 仅在逻辑设备开启 `shaderFloat64` 时使用 64 位着色器；否则纯主机数据回退 CPU 参考实现，GPU 专属或 AHB 存储则返回不支持。旧版同步私有作用域 `with_ncnn_gpu` 会在返回前同步等待任务完成，确保借用的调用方上下文在命令挂起期间不会被提前释放。
+- 同一逻辑设备上的所有 domain 共享设备丢失（`MGC_DEVICE_LOST`）状态：丢失发生后会停止接收新任务并使受影响输出作废，但不会直接证明已挂起工作已经结束。需通过 `mgc_domain_service` 推进收尾，直到确认旧设备空闲后再为新设备获取全新的 domain；旧 domain 仅保留用于状态诊断与既有资源清理，同时调用方还须保持外部 AHB、生产者与 GL 义务直至全部完成。
 
-AHB transitions retain their own pools, fences, semaphores and FDs. They do not
-repeat accepted submissions. Failed, definitely unsubmitted release attempts
-may retry their metadata object; logical failure remains recorded. Resource
-ownership is returned only after the actual transition and metadata application
-are confirmed. Producer references are dropped outside GPU scopes.
+## 适用范围与验证说明
 
-The managed ncnn command retains its buffer/image/host references and records
-CPU access/layout snapshots before modifying them. A definitely unsubmitted
-tail can be discarded with snapshot rollback; pending/uncertain submissions
-cannot. Host finalization caches failure so partial host copies are not replayed.
-Consumers still own Net, pipeline, allocator, model and external host-target
-lifetimes through the supplied strong context.
-
-Completed GPU cleanup and clearing this owner's pending state precede DONE.
-Metadata-only owner release retries bypass ordinary record admission, so another
-owner cannot block an already-retired task's callback through that gate.
-
-The generic GPU COPY, ReLU, normalize, statistics and supported RGB resize
-operations use owned, staged work; intermediate network transfers are retained
-with the same job. RGB resize uses binary64 shaders only when enabled by the
-logical device. Otherwise host-to-host resize uses the CPU reference and GPU-only
-or AHB storage returns unsupported. Shader rounding remains device-dependent and
-must be validated for each workload. Standalone capability and AHB-transition
-work uses bounded retained jobs.
-The older private synchronous scope waits for retirement before returning, so its
-borrowed caller context is never released while its command remains pending.
-
-Device loss is shared by domains on the same logical device. It stops admission
-and invalidates failed output, but does not by itself prove that retained work
-has retired. Service calls keep the old generation until an actual device-idle
-result establishes retirement; only then may a new domain use a fresh logical
-device. Old domains remain usable for diagnostics and origin-owned cleanup, not
-new GPU operations. `mgc_domain_state` reports the state and
-`mgc_domain_service` advances retirement; callers must also keep external AHB,
-producer and GL ownership until their independent obligations complete.
-Capability records distinguish a successful retired submission from workload
-qualification, and report device loss for Vulkan-dependent features after loss.
-
-These rules do not make arbitrary raw command consumers safe automatically.
-Neither a hard driver-call wall-clock deadline nor Android hardware, complete
-workload or performance qualification is implied by these source contracts.
+上述源码级契约不自动保证任意裸 Vulkan 命令调用方的安全性，也不承诺驱动调用的绝对硬实时上限；浮点舍入行为因 GPU 设备而异，能力查询通过不代表具体工作负载的精度、Android 真机硬件表现或完整发布门禁已通过验证。

@@ -1,40 +1,117 @@
 ---
 name: meguviz-compute
-description: 在 C、C++ 或 Android NDK 项目中接入 MeguvizCompute，或迁移已有 CPU/Vulkan 缓冲与任务到其资源、租约和有界提交接口。也适用于评估与 MeguvizMemory 的可选缓冲协作。
+description: 在 C、C++ 或 Android NDK 项目中新接入 MeguvizCompute（1.2.2），或将已有 CPU/Vulkan 缓冲区、张量算子、AHardwareBuffer 同步流及 ncnn 计算迁入其资源租约与有界异步提交接口。当涉及 MgcRuntime、MgcLease、AHardwareBuffer 同步围栏、MgcShaderpack 加载或评估与 MeguvizMemory 协作时触发；纯 CPU 内存池管理转交 MeguvizMemory，离线 GLSL 编译与打包转交 MeguvizShaderTools，视频插帧与媒体编解码分别转交 MeguvizRIFE 与 MeguvizMedia。
 ---
 
-# 接入 MeguvizCompute
+# MeguvizCompute 接入与迁移
 
-## 选定一条现有数据流
+`MeguvizCompute`（`1.2.2`）为 C11/C++17 与 Android NDK 应用提供统一的计算资源租约、有界异步提交、内建 CPU/Vulkan 算子、`MgcShaderpack` 运行时加载以及 `AHardwareBuffer` 跨端同步接口。
 
-找到调用方的构建目标和准备迁移的一个操作，记录当前分配、最后访问、完成通知和释放位置。优先使用项目已锁定的 Compute SDK。若引用了本 skill 所在仓库之外的消费者，先找本地 SDK 前缀或对应源码 checkout。以所选版本的头文件、CMake 导出和 `build-info.json` 为准，复用现有目标与构建参数。
+## 第 1 阶段：盘点工程现状
 
-| 需求 | 接入点 |
-| --- | --- |
-| CPU 操作或首次接入 | `find_package(MeguvizCompute 1.2.2 CONFIG REQUIRED)` 并链接 `MeguvizCompute::core`。公共头为 `<meguviz/compute.h>`，从 `examples/c_consumer.c` 的 COPY 链路开始。 |
-| Android GPU/AHardwareBuffer | 同一 Compute domain 内使用 `<meguviz/compute_android.h>`。检查实际 SDK/ABI、目标缓冲区的格式与 usage、所用同步模式和目标设备能力。保留调用方已有的兼容路径。 |
-| 内部 ncnn 算法适配 | 仅在适配器确实需要时链接 `MeguvizCompute::backend_ncnn_sdk`，以该 ABI 的 `MGC_REQUIRED_PRIVATE_SDK_FINGERPRINT` 匹配 Compute SDK。由 Compute 提供唯一 ncnn owner。 |
+修改代码前，先读取消费方的构建配置与当前版本信息，并输出简短评估：
 
-## 实现最小迁移
+1. **检查构建配置与安装前缀**：读取消费方 `CMakeLists.txt`、`CMakePresets.json`、`build.gradle.kts` 及目标 SDK 前缀中的 `lib/cmake/MeguvizCompute/build-info.json`，确认已安装的头文件、`MeguvizComputeConfig.cmake` 与实际工具链匹配。
+2. **核对版本与工具链基线**：
+   - 需要 CMake `3.31+` 与 C++17 编译器；Windows 端 Compute 默认使用静态 CRT（`MultiThreaded$<$<CONFIG:Debug>:Debug>`），消费方须保持一致。
+   - Android 端最低支持 `android-27`（`ANDROID_STL=c++_static`），动态库链接建议启用 16 KiB ELF 页对齐（`-Wl,-z,max-page-size=16384`）。
+3. **梳理目标数据流与 `ncnn` 归属**：记录待迁移缓冲的分配、最后写入、任务触发、完成通知与释放点；检查工程中是否已引入其他 `ncnn` 目标。`MeguvizCompute` 独占 `ncnn` 实例，若外部已存在同名 `ncnn` target，配置阶段会直接报错。
+4. **明确迁移与回退方案**：先选定一条独立数据流做最小改造，并保留原有 CPU 参考实现或宿主既有路径作为回退，确认方案后再修改源码。
 
-1. 先建立 runtime/domain/session，在描述符填 `MGC_HEADER_INIT(类型)` 和必需字段，其余字段置零。为每次写入建立新的 content ID，取得 WRITE 后再写。仅在对应 lease 下使用 map 指针，结束后 unmap；按头文件的握手将已完成的数据交给 READ。
-2. 准备单独的提交引用。只有 `MGC_ACCEPTED` 转移这些引用，拒绝时调用方归还。仍需在外部使用的 lease 保留独立引用。完成和上下文释放回调可能在提交函数返回前执行，避免让它们依赖提交函数尚未写回的数据。
-3. 在完成后检查终态和状态。取消、超时或设备丢失时停止追加工作并保留仍在使用的资源，直到完成物理退役。成功 drain 才覆盖 session 的已接受工作、回调和提交引用；消费者持有的输出单独释放。Android 外部访问成功取得的 reservation 由同一 lease 归还，遵守头文件里的 owned/borrowed fd 语义。
+## 第 2 阶段：选择模块与接入依赖
 
-### 与 Memory 协作时
+在消费方 `CMakeLists.txt` 中通过 `find_package(MeguvizCompute 1.2.2 CONFIG REQUIRED)` 引入，并仅链接实际需要的目标：
 
-只有调用方选择 Memory 时才接入适配器，Compute 公共 SDK 可以独立使用。对 Memory 持有的 CPU 数据，核对两个 SDK 的 ABI、工具链及 MSVC CRT，使用 Memory 源码 `adapters/compute_host` 中的 `MeguvizMemoryComputeHostBridge::host_bridge` 和 `mgmem_compute_host`（C++ `mgmem::compute::host`），并确认所选 Compute 提供 `mgc_resource_import_host_v1`。导入省去 CPU backing 的复制；借用和错误回调上下文一直保留至资源、租约及执行引用归还。
+| 使用场景 | CMake Target | 公共头文件 | 边界与前提 |
+| --- | --- | --- | --- |
+| CPU 拷贝、外部内存导入与通用调度 | `MeguvizCompute::core` | `<meguviz/compute.h>` | 公开 C ABI，不暴露 `ncnn`，可完全独立接入 |
+| 归一化、ReLU、统计与 RGB 缩放算子 | `MeguvizCompute::kernels` | `<meguviz/kernels.h>` | 传递链接 `core`，`RESIZE_RGB8` GPU 路径需设备支持 `shaderFloat64` |
+| 运行时加载并校验离线着色器包 | `MeguvizCompute::core` | `<meguviz/shaderpack.h>` | 配合 `MeguvizShaderTools` 产出的 pack 目录使用 |
+| Android `AHardwareBuffer` 与同步围栏 | `MeguvizCompute::core` | `<meguviz/compute_android.h>` | 先查询域能力，按结果启用同步或回退路径 |
+| 内部 `ncnn` 图推理与自定义扩展 | `MeguvizCompute::backend_ncnn_sdk` | `<meguviz/backend_ncnn_sdk.hpp>` | 仅限内部算法适配，须通过 `-DMGC_REQUIRED_PRIVATE_SDK_FINGERPRINT` 锁定指纹 |
 
-从 Compute 向 Memory 交付时，`adapters/compute` 的 `read_bridge` 接收完整且就绪的 CPU READ lease；Arena 需要该 SDK 的独立 `arena_read_bridge` 目标。一次性上传/下载由 `adapters/compute_host/TRANSFER.md` 的桥提交 Compute COPY，GPU 上传/下载可能仍经 staging。对同一份不变上传或重复下载，可按该目录 `REUSE.md` 的实际接口提前准备 staging。GPU-only、受保护内容和 AHB 仍走原设备同步与所有权路径。
+**兄弟库与桥接边界**：
+- **纯 CPU 内存复用**：不涉及异步任务或 GPU/ncnn 计算时，转交 `MeguvizMemory`。
+- **与 `MeguvizMemory` 协作**：仅在消费方明确使用 `MeguvizMemory` 时，按需引入 `MeguvizMemory` 仓库 `adapters/` 下的独立桥接包（`compute_host`、`compute`、`compute_ahb`、`compute_gpu_ahb`），不要在未使用 Memory 时提前引入适配器依赖。
+- **离线编译着色器**：转交 `MeguvizShaderTools`（`mgst` 或 `mgst_compile_shaderpack`），Compute 仅负责包加载校验与执行。
 
-## 验证并交付
+## 第 3 阶段：执行最小迁移与生命周期对齐
 
-- 优先运行消费方原有构建和同输入的输出比对。Windows 源码可在仓库根目录运行下列参考检查。其中 `external_host` 覆盖外部 backing，`deferred_host_lifecycle` 覆盖异步退役。
+### 最小 C ABI 接入骨架（COPY 链路）
 
-  ```sh
-  cmake --preset windows-reference
-  cmake --build --preset windows-reference
-  ctest --preset windows-reference --no-tests=error -R "^(public_c_copy|external_host|deferred_host_lifecycle)$"
-  ```
+```c
+#include <meguviz/compute.h>
+#include <string.h>
 
-- 迁移 Android 时，单列交叉构建、真实设备的 AHB/同步验证和回退验证。记录消费者改动、选用的 SDK 身份和实际执行过的检查。
+// 1. 初始化 runtime / domain / session（所有描述符先清零再用 MGC_HEADER_INIT 初始化）
+MgcRuntimeDesc rd = {0}; rd.header = (MgcHeader)MGC_HEADER_INIT(MgcRuntimeDesc);
+rd.provider = MGC_PROVIDER_CPU_REFERENCE; rd.memory_budget_bytes = 1024 * 1024;
+MgcRuntime *rt = NULL; mgc_runtime_create(&rd, &rt);
+
+MgcDomainDesc dd = {0}; dd.header = (MgcHeader)MGC_HEADER_INIT(MgcDomainDesc);
+MgcDomain *dom = NULL; mgc_domain_acquire(rt, &dd, &dom);
+
+MgcSessionDesc sd = {0}; sd.header = (MgcHeader)MGC_HEADER_INIT(MgcSessionDesc);
+sd.max_in_flight = 4;
+MgcSession *sess = NULL; mgc_session_create(dom, &sd, &sess);
+
+// 2. 创建资源与 WRITE 租约，写入后 unmap 并发布为 READ（每次重写必须递增 content_id）
+MgcLease *in_write = NULL, *in_read = NULL, *out_write = NULL;
+// ... 通过 mgc_resource_create 与 mgc_lease_create 创建缓冲与租约 ...
+void *ptr = NULL; uint64_t bytes = 0;
+mgc_lease_map(in_write, &ptr, &bytes);
+memcpy(ptr, src_buf, len);
+mgc_lease_unmap(in_write);
+mgc_lease_publish_read(in_write, &in_read);
+mgc_lease_release(in_write);
+
+// 3. 为本次提交单独保留租约引用；仅 MGC_ACCEPTED 时交由 Compute 托管
+mgc_lease_retain(in_read);
+mgc_lease_retain(out_write);
+MgcSubmitDesc job = {0}; job.header = (MgcHeader)MGC_HEADER_INIT(MgcSubmitDesc);
+job.operation = MGC_OPERATION_COPY; job.input = in_read; job.output = out_write;
+job.byte_count = len; job.request_id = 1;
+MgcTicket *ticket = NULL;
+MgcStatus st = mgc_submit(sess, &job, &ticket);
+if (st != MGC_ACCEPTED) {
+    mgc_lease_release(in_read);
+    mgc_lease_release(out_write);
+} else {
+    mgc_session_drain(sess, 1000000000ULL);
+    MgcCompletion done = {0}; done.header = (MgcHeader)MGC_HEADER_INIT(MgcCompletion);
+    mgc_ticket_query(ticket, &done);
+    // 校验 done.terminal == MGC_TERMINAL_SUCCESS && done.status == MGC_SUCCESS
+    mgc_ticket_release(ticket);
+}
+
+// 4. 关闭顺序：先排空并关闭 session，消费方读取输出后再释放 lease / resource / domain / runtime
+mgc_session_close(sess);
+// ... 读取 out_write 后释放 in_read、out_write、资源与 domain ...
+mgc_runtime_close(rt);
+mgc_runtime_release(rt);
+```
+
+### 生命周期、线程与所有权铁律
+
+1. **描述符合同与内容版本**：结构体先清零再填 `MGC_HEADER_INIT(类型)`；GPU 资源（`usage != 0`）不支持 CPU 映射。每次重新填充同一资源前，必须使用新的 `content_id` 申请新 `WRITE` 租约。
+2. **异步回调时序**：完成回调和上下文释放回调在 session 工作线程执行，且**可能在 `mgc_submit` 返回前已经触发**；回调上下文须事先就绪且回调内禁止抛出 C++ 异常。严禁在完成回调内部调用 `mgc_session_drain` 或 `mgc_session_close`（会返回 `MGC_BUSY`）。
+3. **取消、排空与资源保留**：取消（`mgc_ticket_cancel`）、超时或出现 `MGC_DEVICE_LOST` 时，应停止追加新任务并保留仍在使用的资源，直到后台任务彻底结束。`mgc_session_drain` 成功表示已接收任务、回调与提交引用均已结束，消费方持有的输出租约仍须自行释放。
+4. **Android `AHardwareBuffer` 与同步围栏**：`mgc_android_import` 仅借用调用方传入的 AHB 与 fd（内部会增加引用并复制 fd），原句柄仍由调用方关闭或释放；通过 `mgc_android_release_to_external` 取得的外部访问必须由同一 lease 调用 `mgc_android_set_acquire_fence` 归还（未下发 GPU 工作时传 `-1`）。
+5. **动态库卸载安全**：Linux/Android 动态库消费方须与 Compute 处于同一导出 `meguviz_code_image_anchor_v1` 的模块内，且宿主须保留动态库加载引用直至所有 session 与 owner 成功关闭。
+
+> **按需深入阅读**：完整 C/C++ API 签名、状态码、Android AHB 扩展、`backend_ncnn_sdk` 与 `MeguvizMemory` 桥接详情见 [API 与模块速查](references/api-and-modules.md)；存量代码迁移对照、外部主机内存导入、设备丢失恢复及排障表见 [迁移对照与排障](references/migration-patterns.md)。
+
+## 第 4 阶段：验证与交付清单
+
+1. **消费方验证**：先运行接入工程原有的编译与单测，对同一组输入执行迁移前后的输出比对，确认数值与资源计数无泄漏。
+2. **本库源码自检**：在 `MeguvizCompute` 源码根目录按当前配置运行对应验证预设：
+   - **CPU 参考版本（Windows）**：
+     ```sh
+     cmake --preset windows-reference
+     cmake --build --preset windows-reference
+     ctest --preset windows-reference --no-tests=error -R "^(public_c_copy|external_host|deferred_host_lifecycle)$"
+     ```
+   - **完整开发 SDK 验证（含 `ncnn` 安装与消费方反向校验）**：运行 `python tools/verify_development_sdk.py --preset windows-cpu`（或 `--preset windows-reference`）。
+   - **Android 交叉构建与 ELF 检查**：运行 `python tools/verify_android_sdk.py --abi arm64`（或 `v7`），再在真实设备上补充 `AHardwareBuffer`、同步围栏与设备丢失恢复测试。
+3. **失败与回退核对**：确认 `MGC_BUSY`、`MGC_TIMEOUT`、`MGC_DEVICE_LOST` 分支均能正确保留资源不崩溃，且保留的 CPU 参考路径或原有实现可安全回退。
+4. **交付摘要**：记录修改文件清单、选用的 Compute SDK 版本与 `private_sdk_fingerprint`（如使用私有 SDK）、实际执行的命令结果，并明确标注哪些结论仅覆盖宿主测试、哪些已通过真机验证。

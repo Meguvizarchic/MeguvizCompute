@@ -1,70 +1,27 @@
-# AHB producer fence admission
+# Android AHB 生产者围栏与受保护交接契约
 
-Android AHB producer dependencies are retained by the resource content, so a
-new READ lease for the same content cannot bypass the original import fence.
-An accepted session job verifies the fence status without holding the GPU
-execution slot. Only a confirmed successful producer can be consumed; a
-negative status reports `MGC_PRODUCER_FAILED`, invalidates the affected output
-and retains uncertain producer resources. Unsupported or uninspectable status
-is an error, not successful data. Native sync-fd previously allowed a Vulkan
-acquire command to be submitted before userspace confirmed producer success;
-this repair deliberately waits before the actual GPU acquire instead. Its
-device latency and throughput have not been qualified.
+## 1. 常规 AHB 生产者依赖校验
 
-The additive guarded producer handoff is experimental and OFF by default. Its
-build option is recorded in the build fingerprint; capability 19 and its two
-entry points fail closed unless that build option and the Android Vulkan/AHB
-requirements are met. Registration transfers no caller FD ownership, retains
-the exact producer lease, and returns the reservation generation. Consumers
-may be accepted while the producer and cleanup are pending, but cannot run
-until the fence reports success and the matching generation's cleanup gate is
-confirmed. A failed cleanup is reported to accepted consumers while retaining
-the producer pin and FD; it is not physical retirement. Unknown outcomes stay
-isolated. Never complete a different generation or release backing based on
-submission, cancellation or a failed fence alone.
+Android `AHardwareBuffer` 的生产者依赖直接绑定在资源内容版本上，因此为同一内容新建 `READ` 租约无法绕过导入时登记的生产者同步围栏（sync fd）。
 
-An accepted guarded ticket that is cancelled invalidates its WRITE outputs
-before releasing their in-flight protection; callers need a new content
-version. In private owned GPU batches every guarded input and every WRITE
-output must already be listed in the accepted ticket, otherwise the batch
-fails before recording. A successful private retired-WRITE release is an
-irrevocable publication point for a guarded ticket: cancellation before
-that point prevents transfer, while cancellation afterward returns BUSY until
-completion. These added restrictions do not apply to ordinary non-guarded
-tickets. The original producer pin remains controlled by its own fence and
-cleanup state, independently of ticket cancellation.
+- 已接收的 session 任务会在**不持有 GPU 执行槽位**的前提下检查 fence 状态。只有明确检查到生产者 fence 成功完成，下游才可消费该内容。
+- 若 fence 状态为负或检查失败，任务报告 `MGC_PRODUCER_FAILED`，作废受影响的输出，并继续保留状态不确定的生产者资源；不支持检查或无法查询状态的 fence 同样按错误失败处理，绝不视作就绪数据。
+- 此前原生 sync-fd 路径允许在用户态确认生产者成功前就将 Vulkan acquire 命令提交给驱动；当前实现改为在实际 GPU acquire 之前完成等待与状态确认。
 
-In an experimental guarded build, a cleanup completion, reported failure,
-cancellation, acceptance or session close notifies a shared session wake
-object. Resources hold a small bounded array of weak references to that wake
-(two slots). accept() rejects a second ticket while a resource is in flight; a
-private batch may also register a requested lease that is not counted in-flight,
-so contention beyond the capacity falls back to the bounded watchdog. In the
-Android guarded build the array resides in the already-required per-AHB
-allocator; ordinary CPU/GPU-buffer resources do not carry it and no additional
-per-AHB allocation is introduced. A guarded-build session embeds its wake in
-the existing shared session identity: on Android it is an eventfd, where a
-notify is a counter increment so a signal racing with poll() cannot be lost,
-while the host test build keeps an epoch and condition variable. The wake uses
-an aliasing shared pointer and introduces no additional per-session allocation;
-that identity allocation is larger and can outlive the session while a ticket
-remains alive. Completed tasks unregister their waiter.
+## 2. 实验性受保护生产者交接（Guarded Producer）
 
-The worker probes every accepted ticket without holding the session lock and
-executes the first one whose producer fence and cleanup gate are ready. A
-ticket whose producer is still pending stays in the worker's pending list (it
-does not re-enter s->queue), so an older unready producer no longer blocks a
-newer independent ticket: completion order is readiness order, not submission
-order. accept() still rejects a second
-ticket that references an in-flight resource, which is what makes the reorder
-safe. A deferred GPU job still occupies the single worker while it retires.
+受保护生产者交接为增量实验特性，默认关闭（`MGC_GUARDED_PRODUCER_FENCE_EXPERIMENTAL=OFF`），其开关状态写入构建指纹；除非构建开启该选项且运行环境满足 Android Vulkan/AHB 要求，否则能力 `19`（`MGC_CAP_GUARDED_PRODUCER_FENCE`）及其两个专用入口都会直接返回未支持。
 
-While no ticket is ready, the worker blocks in poll() on the session eventfd
-plus duplicated external fence descriptors, so an unsignaled external fence
-wakes it through the kernel instead of a timer. A satisfied fence behind a
-still-closed cleanup gate is not polled (that would spin); the gate-opening
-call notifies the eventfd. A one-second watchdog covers error paths that have
-neither a pollable fd nor a notify (device loss, an unverifiable fence). The
-host test build keeps a 5 ms bounded wait because it has no fd to poll. The OS
-may schedule a longer delay. Waiting does not hold the GPU slot. No device or
-emulator result is implied by host tests or Android cross-compilation.
+- **登记阶段（`mgc_android_set_guarded_producer_fence`）**：不转移调用方传入的 fd 所有权（内部保留所需状态），锁定原生产者租约并返回预约代次 `generation`，同时将独立的宿主清理门控置为未完成状态。下游消费者任务此时可以被接收进入队列，但必须同时满足“sync-file 状态确认成功”和“匹配代次的清理门控已确认”两个条件后才能真正执行。
+- **清理确认阶段（`mgc_android_finish_guarded_producer`）**：传入 `MGC_SUCCESS` 表示宿主清理完成；传入 `MGC_PRODUCER_FAILED` 会向排队中的消费者报告失败，同时继续保留生产者锁定与 fd（该状态不等于硬件工作已经退出）。遇到未知结果时应保持隔离，严禁跨代次完成或仅凭已提交/已取消/fence 失败就释放底层缓冲。
+- **取消与输出保护**：已接收的受保护 ticket 若被取消，会在释放保护锁前先作废其 `WRITE` 输出，调用方必须使用新的 `content_id` 重建内容。在私有托管 GPU 批次中，所有受保护输入与 `WRITE` 输出都必须在最初接收 ticket 时登记在列，否则录制前直接失败。成功调用 `mgc_private_ticket_release_retired_write` 是不可逆的发布节点：此前取消会阻止发布，此后取消则直接返回 `MGC_BUSY` 直到任务彻底结束。上述额外约束不影响普通非受保护 ticket；原生产者锁定状态始终只受自身 fence 与清理门控控制，不受消费者取消影响。
+
+## 3. 唤醒机制与就绪顺序调度
+
+- 在开启受保护交接的构建中，清理完成、失败上报、任务取消、接收提交或关闭 session 都会通知共享的 session 唤醒对象。资源内部保存有界弱引用数组（`2` 个槽位）：Android 构建中该数组直接复用每个 AHB 已有的分配器内存，普通 CPU/GPU 缓冲不额外分配，也不会引入新的 per-AHB 内存分配；session 的唤醒对象直接嵌入已有的共享 session 身份对象中（Android 端使用 `eventfd` 累加计数以防止信号与 `poll()` 竞态丢失；宿主测试构建使用纪元计数与条件变量）。若并发等待者超过槽位上限，则自动降级到有界看门狗轮询；任务完成后注销等待者。
+- 工作线程在不持有 session 锁的状态下探测全部已接收 ticket，并优先执行第一个生产者 fence 与清理门控均已就绪的 ticket。尚未就绪的任务留在工作线程的挂起列表中（不再回到 `s->queue`），因此滞后的生产者不会阻塞后续相互独立的请求：任务完成顺序遵循**就绪顺序**而非提交顺序。同时，接收阶段仍会拒绝引用同一在途资源的第二个 ticket，以保证重排安全；延迟收尾的 GPU 任务在退出过程中仍会占用单个工作线程。
+- 当所有挂起任务均未就绪时，工作线程通过 `poll()` 同时监听 session 的 `eventfd` 与复制出的外部 fence 描述符，由内核直接唤醒而非空转定时器；对于“fence 已触发但清理门控仍未放行”的条目，不再加入 `poll()` 监听集合，交由 `finish_guarded_producer` 触发 `eventfd` 唤醒。对于无 fd 可监听或无通知的异常路径（如设备丢失、无法校验的 fence），Android 端设有 `1` 秒看门狗兜底，宿主测试构建使用 `5 ms` 有界等待。等待期间均不占用 GPU 执行槽位。
+
+## 适用范围与验证说明
+
+宿主伪同步测试与 Android 交叉编译均不代表真实设备延迟、吞吐量或驱动兼容性；受保护交接与等待路径的真实设备和模拟器端到端表现尚未完成完整硬件定级。
